@@ -146,10 +146,17 @@ describe("RtcSession", () => {
     expect(s.session.isConnected).toBe(true);
 
     const frames: Array<[string, number]> = [];
+    const media: Array<[string, number]> = [];
     s.session.on("commandData", (f, lt) => frames.push([f.toString(), lt]));
-    s.peer.emit("data", "WebrtcDataChannel", Buffer.from("XZYH"), 3);
-    s.peer.emit("data", "video", Buffer.from("v"), 0);
+    s.session.on("mediaData", (f, lt) => media.push([f.toString(), lt]));
+    s.peer.emit("data", "notify", Buffer.from("XZYH"), 3);
+    s.peer.emit("data", "video", Buffer.from("v"), 5);
+    s.peer.emit("data", "playback", Buffer.from("p"), 4);
     expect(frames).toEqual([["XZYH", 3]]);
+    expect(media).toEqual([
+      ["v", 5],
+      ["p", 4],
+    ]);
     expect(s.session.sendCommand(Buffer.from("XZYH"))).toBe(true);
     expect(s.errors).toEqual([]);
   });

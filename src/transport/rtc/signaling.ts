@@ -94,6 +94,11 @@ export interface RtcSignalingOptions {
   /** The mega session's user id — `gtoken` is its md5. */
   userId: string;
   stationSn: string;
+  /**
+   * The camera the session is for, when it is a per-camera (live) session rather than the hub's own —
+   * the portal sends it on every session message as `subSn`, empty for the hub.
+   */
+  subSn?: string;
   /** The station's `member.admin_user_id`, the account the session HMAC names. */
   adminUserId: string;
   /** The mega shard the account lives on; picks the host and the cluster name. */
@@ -302,6 +307,7 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
       action: 3,
       sessionId: this.sign,
       sn: this.opts.stationSn,
+      subSn: this.opts.subSn ?? "",
       channelId,
       isResponse: 0,
       dataType,

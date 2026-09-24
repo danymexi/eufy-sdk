@@ -19,6 +19,7 @@
 import { EventEmitter } from "node:events";
 import { noopLogger, type Logger } from "../../core/logger.js";
 import { RtcPeer, type RtcPeerOptions, type TurnConfig } from "./peer.js";
+import { PortalLinkType } from "./portal-packet.js";
 import { scallJsonToSdp } from "./scall-sdp.js";
 import { RtcSignalingClient, type RtcInnerMessage, type RtcSignalingOptions } from "./signaling.js";
 
@@ -42,7 +43,15 @@ export interface RtcSessionEvents {
   error: [err: Error];
   /** A frame off the command/notify path: portal packet bytes + the link type it arrived on. */
   commandData: [frame: Buffer, linkType: number];
+  /** A frame off the live / playback / file path — media, for a per-camera session. */
+  mediaData: [frame: Buffer, linkType: number];
 }
+
+const MEDIA_LINK_TYPES: ReadonlySet<number> = new Set([
+  PortalLinkType.LIVE,
+  PortalLinkType.PLAYBACK,
+  PortalLinkType.FILE,
+]);
 
 interface CallPayload {
   status?: number;
@@ -110,8 +119,9 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       }
     });
     this.peer.on("error", (e) => this.emit("error", e));
-    this.peer.on("data", (label, frame, linkType) => {
-      if (label === "WebrtcDataChannel") this.emit("commandData", frame, linkType);
+    this.peer.on("data", (_label, frame, linkType) => {
+      if (MEDIA_LINK_TYPES.has(linkType)) this.emit("mediaData", frame, linkType);
+      else this.emit("commandData", frame, linkType);
     });
   }
 
