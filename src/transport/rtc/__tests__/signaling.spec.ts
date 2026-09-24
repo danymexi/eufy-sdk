@@ -180,6 +180,7 @@ describe("socket handshake", () => {
       action: 3,
       sessionId: "SIGNBLOB",
       sn: "T9000P2026220AA6",
+      subSn: "",
       channelId: 0,
       isResponse: 0,
       dataType: "scall",

@@ -4,7 +4,9 @@
  *
  * The hub is the offerer: it sends its SDP once it has granted the session, we answer. Six data channels
  * are declared in the portal's order (`WebrtcDataChannel` first — the command channel — then audio, idr,
- * video, notify, download); only the command channel and `notify` carry anything this transport reads.
+ * video, notify, download). Every one of them carries PTCS-framed portal packets; which logical channel
+ * a reassembled frame belongs to is the PTCS header's channel (command / notify / live / …), not the
+ * data channel it rode on, and the portal's own receiver reads it the same way.
  *
  * ICE on a LAN is deliberately **host-only** by default. The hub offers a TURN relay and a
  * server-reflexive candidate too, and both pass STUN checks — so ICE may nominate one — yet neither
@@ -18,6 +20,7 @@
 import { EventEmitter } from "node:events";
 import { noopLogger, type Logger } from "../../core/logger.js";
 import type { PortalFramer, PortalFramerFactory } from "./framer.js";
+import { PortalLinkType } from "./portal-packet.js";
 import { PtcsFramer } from "./ptcs-framer.js";
 import {
   ANKER_MAX_MESSAGE_SIZE,
@@ -106,6 +109,22 @@ export interface RtcPeerEvents {
 /** The portal's channel list; index 0 is the command channel. */
 export const DATA_CHANNEL_LABELS = ["WebrtcDataChannel", "audio", "idr", "video", "notify", "download"] as const;
 export const COMMAND_CHANNEL = DATA_CHANNEL_LABELS[0];
+
+/** Which logical channel a reassembled frame belongs to, named after the portal's data channels. */
+export function labelForLinkType(linkType: number): string {
+  switch (linkType) {
+    case PortalLinkType.NOTIFY:
+      return "notify";
+    case PortalLinkType.LIVE:
+      return "video";
+    case PortalLinkType.FILE:
+      return "download";
+    case PortalLinkType.PLAYBACK:
+      return "playback";
+    default:
+      return COMMAND_CHANNEL;
+  }
+}
 /** SCTP stream ids the portal assigns (odd, in channel order). */
 const DATA_CHANNEL_IDS: Record<string, number> = {
   WebrtcDataChannel: 1,
@@ -308,11 +327,11 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     dc.onError((err) => this.emit("error", new Error(`RTC data channel ${label}: ${err}`)));
     dc.onMessage((msg) => {
       const buf = typeof msg === "string" ? Buffer.from(msg) : Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-      // The command, notify and download channels all carry framed packets; the rest are raw.
-      if ((label === COMMAND_CHANNEL || label === "notify" || label === "download") && this.framer?.isReady()) {
+      if (this.framer?.isReady()) {
         this.framer.recvPacket(buf);
         return;
       }
+      // Before the framer is up (the command channel not open yet) nothing can be reassembled.
       this.emit("data", label, buf, 0);
     });
   }
@@ -326,7 +345,7 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
         (packet) => {
           if (dc.isOpen()) dc.sendMessageBinary(packet);
         },
-        (frame, linkType) => this.emit("data", COMMAND_CHANNEL, frame, linkType),
+        (frame, linkType) => this.emit("data", labelForLinkType(linkType), frame, linkType),
       )
       .catch((e: unknown) => {
         if (this.framer === framer) {

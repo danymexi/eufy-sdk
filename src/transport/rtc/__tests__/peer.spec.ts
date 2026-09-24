@@ -232,11 +232,14 @@ describe("RtcPeer", () => {
     const notify = pc().channels.find((c) => c.label === "notify")!;
     notify.fireMessage(Buffer.from("XZYHpush--16-bytes"));
     const video = pc().channels.find((c) => c.label === "video")!;
+    video.fireMessage(Buffer.from("XZYHvideo-16-byte!"));
     video.fireMessage(Buffer.from("raw"));
+    // Every channel feeds the framer; the passthrough framer tags all of them as command frames, and
+    // a three-byte message is not a portal packet at all.
     expect(frames).toEqual([
       [COMMAND_CHANNEL, "XZYHreply-16-bytes", 1],
       [COMMAND_CHANNEL, "XZYHpush--16-bytes", 1],
-      ["video", "raw", 0],
+      [COMMAND_CHANNEL, "XZYHvideo-16-byte!", 1],
     ]);
     const states: string[] = [];
     peer.on("connectionState", (s) => states.push(s));
