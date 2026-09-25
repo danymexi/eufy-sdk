@@ -89,3 +89,16 @@ export function keepHostCandidates(sdp: string): string {
 export function pinMaxMessageSize(sdp: string): string {
   return sdp.replace(/a=max-message-size:\d+/g, `a=max-message-size:${ANKER_MAX_MESSAGE_SIZE}`);
 }
+
+/**
+ * Force a concrete DTLS role into an SDP. The hub offers `actpass`, leaving the choice to us — and the
+ * choice is not free: RFC 8832 gives the DTLS **client** the even SCTP stream ids and the **server**
+ * the odd ones, while the portal (and this client) open their data channels on odd ids 1/3/5/7/9/11.
+ * Answering `active` would make us the client using server ids, so the channels open locally and the
+ * hub never sees them — the session comes up and then nothing ever arrives.
+ */
+export function forceDtlsRole(sdp: string, role: "active" | "passive"): string {
+  if (/a=setup:(active|passive|actpass)/.test(sdp))
+    return sdp.replace(/a=setup:(active|passive|actpass)/g, `a=setup:${role}`);
+  return sdp.replace(/(m=application[^\r\n]*\r?\n)/, `$1a=setup:${role}\r\n`);
+}

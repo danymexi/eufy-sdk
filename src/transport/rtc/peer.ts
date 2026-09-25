@@ -25,6 +25,7 @@ import { PtcsFramer } from "./ptcs-framer.js";
 import {
   ANKER_MAX_MESSAGE_SIZE,
   HUB_SDP_MID,
+  forceDtlsRole,
   iceCandidateType,
   keepHostCandidates,
   pinMaxMessageSize,
@@ -95,6 +96,19 @@ export interface RtcPeerOptions {
   logger?: Logger;
   /** How long to wait for libdatachannel to produce the local answer. */
   answerTimeoutMs?: number;
+  /**
+   * Rewrite the DTLS role advertised in the answer. Off by default, and it should stay off: this only
+   * edits the SDP text, it does not change the role libdatachannel actually plays, so announcing a role
+   * it is not playing deadlocks the handshake (verified live — the peer goes straight to `failed`).
+   * libdatachannel answers `passive`, which makes us the DTLS server and the odd SCTP stream ids of
+   * {@link DATA_CHANNEL_IDS} the correct ones. Kept only as an escape hatch for probing other firmware.
+   */
+  dtlsRole?: "active" | "passive";
+  /**
+   * How to assign SCTP stream ids: `portal` (default) pins the portal's odd ids, which match the DTLS
+   * server role libdatachannel takes; `auto` leaves the choice to libdatachannel.
+   */
+  dataChannelIds?: "auto" | "portal";
 }
 
 export interface RtcPeerEvents {
@@ -127,7 +141,12 @@ export function labelForLinkType(linkType: number): string {
       return COMMAND_CHANNEL;
   }
 }
-/** SCTP stream ids the portal assigns (odd, in channel order). */
+/**
+ * SCTP stream ids the portal assigns (odd, in channel order). RFC 8832 splits the id space by DTLS
+ * role — the client takes the even ids, the server the odd ones — so these hold as long as we answer
+ * the hub's `actpass` offer with `passive`, which is what libdatachannel does and what the hub needs
+ * (it only ever completes DTLS as the client).
+ */
 const DATA_CHANNEL_IDS: Record<string, number> = {
   WebrtcDataChannel: 1,
   audio: 3,
@@ -240,7 +259,9 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
         this.localAnswer = undefined;
       }
       this.flushPending();
-      return pinMaxMessageSize(answer);
+      return this.opts.dtlsRole
+        ? forceDtlsRole(pinMaxMessageSize(answer), this.opts.dtlsRole)
+        : pinMaxMessageSize(answer);
     } finally {
       this.handlingOffer = false;
     }
@@ -315,7 +336,8 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     if (!this.pc || this.channelsCreated) return;
     this.channelsCreated = true;
     for (const label of DATA_CHANNEL_LABELS) {
-      const dc = this.pc.createDataChannel(label, { id: DATA_CHANNEL_IDS[label], unordered: false });
+      const pinned = this.opts.dataChannelIds === "auto" ? undefined : DATA_CHANNEL_IDS[label];
+      const dc = this.pc.createDataChannel(label, { id: pinned, unordered: false });
       this.wireChannel(label, dc);
     }
   }
