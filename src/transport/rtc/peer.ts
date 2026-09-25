@@ -97,11 +97,13 @@ export interface RtcPeerOptions {
   /** How long to wait for libdatachannel to produce the local answer. */
   answerTimeoutMs?: number;
   /**
-   * Rewrite the DTLS role advertised in the answer. Off by default, and it should stay off: this only
-   * edits the SDP text, it does not change the role libdatachannel actually plays, so announcing a role
-   * it is not playing deadlocks the handshake (verified live — the peer goes straight to `failed`).
-   * libdatachannel answers `passive`, which makes us the DTLS server and the odd SCTP stream ids of
-   * {@link DATA_CHANNEL_IDS} the correct ones. Kept only as an escape hatch for probing other firmware.
+   * Pin OUR DTLS role, by pinning the complement into the hub's offer before it is applied — the role
+   * has to be fixed where it is DECIDED, since rewriting our own answer changes only what we announce
+   * and deadlocks the handshake.
+   *
+   * Defaults to `active`, which is what the portal plays: left to itself libdatachannel answers
+   * `passive`, taking the odd stream ids while the hub is paired with the even ones. Pass `undefined`
+   * to leave the hub's `actpass` alone and let libdatachannel choose.
    */
   dtlsRole?: "active" | "passive";
   /**
@@ -142,18 +144,19 @@ export function labelForLinkType(linkType: number): string {
   }
 }
 /**
- * SCTP stream ids the portal assigns (odd, in channel order). RFC 8832 splits the id space by DTLS
- * role — the client takes the even ids, the server the odd ones — so these hold as long as we answer
- * the hub's `actpass` offer with `passive`, which is what libdatachannel does and what the hub needs
- * (it only ever completes DTLS as the client).
+ * SCTP stream ids the portal assigns, read off its own live session: its `WebrtcDataChannel` is id
+ * **0**, and the rest follow in channel order. Even ids are the DTLS **client**'s half under RFC 8832,
+ * which says what the portal is — and therefore what we have to be, since the hub pairs with one side
+ * of that split and ignores channels opened on the other. Hence the `active` default in
+ * {@link RtcPeerOptions.dtlsRole}: the two are one decision, not two.
  */
 const DATA_CHANNEL_IDS: Record<string, number> = {
-  WebrtcDataChannel: 1,
-  audio: 3,
-  idr: 5,
-  video: 7,
-  notify: 9,
-  download: 11,
+  WebrtcDataChannel: 0,
+  audio: 2,
+  idr: 4,
+  video: 6,
+  notify: 8,
+  download: 10,
 };
 
 function turnServers(turn: TurnConfig): NativeIceServer[] {
@@ -241,8 +244,14 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     if (this.handlingOffer) throw new Error("RTC peer already handling an offer");
     this.handlingOffer = true;
     try {
-      this.createChannels();
-      const offer = this.icePolicy === "host-only" ? keepHostCandidates(offerSdp) : offerSdp;
+      let offer = this.icePolicy === "host-only" ? keepHostCandidates(offerSdp) : offerSdp;
+      // Choosing our DTLS role means editing the role in the HUB's offer, not in our answer. The hub
+      // offers `actpass` and leaves the choice to libdatachannel; rewriting our answer afterwards only
+      // changes what we ANNOUNCE, never the role libdatachannel plays, which deadlocks the handshake.
+      // Pinning the offer to one concrete role leaves libdatachannel exactly one legal answer — the
+      // complement — so what we announce and what we do are the same thing.
+      const dtlsRole = "dtlsRole" in this.opts ? this.opts.dtlsRole : "active";
+      if (dtlsRole) offer = forceDtlsRole(offer, dtlsRole === "passive" ? "active" : "passive");
       const answerWait = new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
           this.localAnswer = undefined;
@@ -250,18 +259,29 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
         }, this.opts.answerTimeoutMs ?? 15_000);
         this.localAnswer = { resolve, reject, timer };
       });
+      // The hub's offer goes in FIRST, and the channels are declared onto the answer it puts us in.
+      // Creating them first is what a reader expects — the answer should describe them — but
+      // `createDataChannel` makes libdatachannel negotiate on its own: it fires `negotiationNeeded` and
+      // produces a local OFFER, leaving the peer in `have-local-offer` when the hub's offer arrives.
+      // Whoever won that race decided the session, and the losing side shipped our offer as the answer:
+      // the hub then ran its connectivity checks against an ICE ufrag/pwd nobody was listening on, so
+      // ICE failed with a textbook-looking signalling log. Data channels need no m-line of their own —
+      // the offer already carries the SCTP one — so declaring them after costs nothing.
       pc.setRemoteDescription(offer, "offer");
       this.remoteSet = true;
-      let answer = pc.localDescription()?.sdp ?? "";
+      this.createChannels();
+      // Only an ANSWER counts. `localDescription()` also answers while the peer sits in
+      // `have-local-offer`, and taking that would ship the offer as the answer — the same failure by a
+      // shorter path.
+      const local = pc.localDescription();
+      let answer = String(local?.type ?? "").toLowerCase() === "answer" ? (local?.sdp ?? "") : "";
       if (!answer) answer = await answerWait;
       else if (this.localAnswer) {
         clearTimeout(this.localAnswer.timer);
         this.localAnswer = undefined;
       }
       this.flushPending();
-      return this.opts.dtlsRole
-        ? forceDtlsRole(pinMaxMessageSize(answer), this.opts.dtlsRole)
-        : pinMaxMessageSize(answer);
+      return pinMaxMessageSize(answer);
     } finally {
       this.handlingOffer = false;
     }

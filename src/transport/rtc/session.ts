@@ -20,7 +20,7 @@ import { EventEmitter } from "node:events";
 import { noopLogger, type Logger } from "../../core/logger.js";
 import { RtcPeer, type RtcPeerOptions, type TurnConfig } from "./peer.js";
 import { PortalLinkType } from "./portal-packet.js";
-import { scallJsonToSdp } from "./scall-sdp.js";
+import { scallJsonToSdp, toWireCandidate } from "./scall-sdp.js";
 import { RtcSignalingClient, type RtcInnerMessage, type RtcSignalingOptions } from "./signaling.js";
 
 export interface RtcSessionOptions extends RtcSignalingOptions {
@@ -104,7 +104,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     this.signaling.on("error", (e) => this.emit("error", e));
 
     // The portal answers on channel 0 and trickles ICE on channel 1.
-    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(c, 1));
+    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c), 1));
     this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate("", 1));
     this.peer.on("commandChannelOpen", () => {
       if (this.connected) return;

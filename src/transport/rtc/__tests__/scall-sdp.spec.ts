@@ -7,6 +7,7 @@ import {
   pinMaxMessageSize,
   scallJsonToSdp,
   sdpToScallJson,
+  toWireCandidate,
 } from "../scall-sdp.js";
 
 const HUB_JSON = {
@@ -76,5 +77,19 @@ describe("candidate helpers", () => {
 
   it("pins the max message size to the hub's", () => {
     expect(pinMaxMessageSize("a=max-message-size:65536\r\n")).toBe(`a=max-message-size:${ANKER_MAX_MESSAGE_SIZE}\r\n`);
+  });
+});
+
+describe("toWireCandidate", () => {
+  it("carries the attribute's value, the way the hub sends its own", () => {
+    // libdatachannel hands out the SDP line; the portal protocol carries what follows `a=`.
+    expect(toWireCandidate("a=candidate:2 1 UDP 2114977535 192.168.178.162 54012 typ host")).toBe(
+      "candidate:2 1 UDP 2114977535 192.168.178.162 54012 typ host",
+    );
+    // Already in wire form, or an end-of-candidates marker: unchanged.
+    expect(toWireCandidate("candidate:1 1 udp 2122317823 192.168.178.142 47336 typ host")).toBe(
+      "candidate:1 1 udp 2122317823 192.168.178.142 47336 typ host",
+    );
+    expect(toWireCandidate("")).toBe("");
   });
 });
