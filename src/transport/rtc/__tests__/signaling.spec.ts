@@ -23,6 +23,7 @@ class FakeSocket implements SignalingSocket {
   constructor(
     readonly url: string,
     readonly protocols: string[],
+    readonly origin?: string,
   ) {}
 
   send(data: string): void {
@@ -85,8 +86,8 @@ function client(overrides: Partial<RtcSignalingOptions> = {}) {
     shard: "eu-pr",
     country: "it",
     fetch: okSign(),
-    createSocket: (url, protocols) => {
-      const s = new FakeSocket(url, protocols);
+    createSocket: (url, init) => {
+      const s = new FakeSocket(url, init.protocols, init.origin);
       sockets.push(s);
       return s;
     },
@@ -179,6 +180,7 @@ describe("socket handshake", () => {
     expect(s.protocols[0]).toBe("v1");
     expect(s.protocols[1]).toBe(base64urlJson(c.subprotocolPayload("SIGNBLOB")));
     expect(s.protocols[1]).not.toMatch(/[+/=]/);
+    expect(s.origin).toBe("https://security.eufy.com");
     s.open();
     await connecting;
     expect(s.sent).toHaveLength(1);
