@@ -18,3 +18,4 @@ docs/.vitepress/cache/
 scratch/
 
 owner-rtc-probe.mjs
+ws-diag.mjs
