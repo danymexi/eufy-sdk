@@ -108,6 +108,27 @@ describe("region rules", () => {
     expect(us.subprotocolPayload("S").region).toBe(WS_REGION_BY_SHARD["us-pr"]);
   });
 
+  it("serves the ie-pr (Ireland/CH) shard from the EU smart host with cluster EU", () => {
+    const ie = client({ shard: "ie-pr", country: "CH" }).c;
+    expect(ie.signUrl).toBe("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign");
+    expect(ie.subprotocolPayload("S").region).toBe("EU");
+  });
+
+  it("hashes gtoken from the account user id, not the ap_cloud userId, and honors an explicit gtoken", async () => {
+    // ap_cloud userId differs from the account user_id whose md5 is the gtoken.
+    const withAccount = client({ userId: "ap-cloud-id", accountUserId: "account-id" });
+    const fetchImpl = withAccount.c["fetchImpl"] as ReturnType<typeof vi.fn>;
+    await withAccount.c.fetchSign();
+    expect((fetchImpl.mock.calls[0][1] as RequestInit).headers).toMatchObject({
+      GToken: gtokenFromUserId("account-id"),
+    });
+    // account id also drives the socket payload's gtoken
+    expect(withAccount.c.subprotocolPayload("S").gtoken).toBe(gtokenFromUserId("account-id"));
+    // an explicit gtoken wins over any derivation
+    const explicit = client({ userId: "x", accountUserId: "y", gtoken: "VERBATIM" }).c;
+    expect(explicit.subprotocolPayload("S").gtoken).toBe("VERBATIM");
+  });
+
   it("sends the portal's sign headers exactly", async () => {
     const fetchImpl = okSign();
     const { c } = client({ fetch: fetchImpl });
