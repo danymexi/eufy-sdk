@@ -99,6 +99,8 @@ export interface RtcPeerOptions {
 
 export interface RtcPeerEvents {
   commandChannelOpen: [];
+  /** The command channel went away while the peer itself may still be up. */
+  commandChannelClosed: [];
   data: [label: string, frame: Buffer, linkType: number];
   iceCandidate: [candidate: string];
   iceGatheringComplete: [];
@@ -160,6 +162,8 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
   private handlingOffer = false;
   private channelsCreated = false;
   private gatheringDone = false;
+  /** Set by the framer's wire callback when the native channel refused a packet mid-send. */
+  private wireSendFailed = false;
   private readonly pending: string[] = [];
   private localAnswer?: { resolve: (sdp: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
   private readonly icePolicy: IcePolicy;
@@ -262,12 +266,21 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     return this.commandOpen && !!dc?.isOpen();
   }
 
-  /** Send one portal packet on the command channel, through the framer. */
+  /**
+   * Send one portal packet on the command channel, through the framer. False when the channel is not
+   * usable OR the native send refused a wire packet — a dropped frame must not read as success.
+   */
   sendCommand(portalPacket: Buffer): boolean {
     const dc = this.channels.get(COMMAND_CHANNEL);
     if (!dc?.isOpen() || !this.commandOpen || !this.framer?.isReady()) return false;
-    this.framer.sendFrame(portalPacket);
-    return true;
+    this.wireSendFailed = false;
+    try {
+      this.framer.sendFrame(portalPacket);
+    } catch (e) {
+      this.logger.warn(`[rtc] command send failed: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+    return !this.wireSendFailed;
   }
 
   close(): void {
@@ -275,8 +288,11 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     this.framer = undefined;
     this.framerInit = undefined;
     if (this.localAnswer) {
+      // Reject rather than drop: handleRemoteOffer is awaiting this, and a silent drop hangs it.
       clearTimeout(this.localAnswer.timer);
+      const pending = this.localAnswer;
       this.localAnswer = undefined;
+      pending.reject(new Error("RTC peer closed while waiting for the local SDP answer"));
     }
     this.commandOpen = false;
     this.gatheringDone = false;
@@ -322,7 +338,12 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
         });
     });
     dc.onClosed(() => {
-      if (label === COMMAND_CHANNEL) this.commandOpen = false;
+      this.logger.debug(`[rtc] data channel closed ${label}`);
+      if (label !== COMMAND_CHANNEL) return;
+      // The command path is the session: announce it so a caller stops believing it is connected.
+      const wasOpen = this.commandOpen;
+      this.commandOpen = false;
+      if (wasOpen) this.emit("commandChannelClosed");
     });
     dc.onError((err) => this.emit("error", new Error(`RTC data channel ${label}: ${err}`)));
     dc.onMessage((msg) => {
@@ -343,7 +364,7 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     this.framerInit = framer
       .init(
         (packet) => {
-          if (dc.isOpen()) dc.sendMessageBinary(packet);
+          if (!dc.isOpen() || !dc.sendMessageBinary(packet)) this.wireSendFailed = true;
         },
         (frame, linkType) => this.emit("data", labelForLinkType(linkType), frame, linkType),
       )

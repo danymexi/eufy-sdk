@@ -299,7 +299,11 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
       }, timeoutMs);
       const ws = this.createSocket(this.wsUrl, { protocols, origin: PORTAL_ORIGIN });
       this.ws = ws;
+      // A socket that closes or errors before it ever opened has to SETTLE connect(); clearing the
+      // timer alone would leave the caller awaiting a promise nothing can resolve.
+      let opened = false;
       ws.addEventListener("open", () => {
+        opened = true;
         clearTimeout(timer);
         this.sendAuth(sign);
         this.startKeepalive();
@@ -316,6 +320,7 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
         const code = ev.code ?? 1006;
         const reason = ev.reason ?? "";
         this.logger.debug(`[rtc] ${this.opts.stationSn} signalling closed ${code} ${reason}`);
+        if (!opened) reject(new Error(`RTC signalling closed before open: ${code} ${reason}`.trim()));
         this.emit("close", code, reason);
       });
       ws.addEventListener("error", (ev) => {
