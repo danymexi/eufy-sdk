@@ -104,8 +104,14 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     this.signaling.on("error", (e) => this.emit("error", e));
 
     // The portal answers on channel 0 and trickles ICE on channel 1.
-    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c), 1));
-    this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate("", 1));
+    // Trickled candidates ride the SAME channel as the session's SDP and scall, not a fixed channel 1.
+    // The portal sends both its SDP answer and every candidate on `this.channel` (the session's own
+    // channelId); pinning candidates to 1 while the session is channel 0 hands the hub candidates it
+    // cannot bind to the DTLS association it just offered — ICE still comes up on the host pair, but
+    // the handshake never completes because the answer and its transport parameters are split across
+    // two channels.
+    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c), this.channelId));
+    this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate("", this.channelId));
     this.peer.on("commandChannelOpen", () => {
       if (this.connected) return;
       this.connected = true;

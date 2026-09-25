@@ -129,9 +129,11 @@ describe("RtcSession", () => {
 
     s.peer.emit("iceCandidate", "our-host");
     s.peer.emit("iceGatheringComplete");
+    // Candidates ride the session's own channel (0 here) — the same channel the SDP answer and ack use,
+    // matching the portal, not a fixed channel 1.
     expect(s.sig.sendInfoCandidate.mock.calls).toEqual([
-      ["our-host", 1],
-      ["", 1],
+      ["our-host", 0],
+      ["", 0],
     ]);
 
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 200 } });

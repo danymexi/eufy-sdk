@@ -382,8 +382,12 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     this.sendSession("info", { sdp: scallJson }, channelId);
   }
 
-  /** Trickle ICE rides channel 1; an empty candidate is end-of-candidates. */
-  sendInfoCandidate(candidate: string, channelId = 1): void {
+  /**
+   * Trickle a candidate on the session's own channel — the portal sends every candidate on the same
+   * channelId as its SDP answer, not on a fixed channel. The default is the command channel; callers
+   * with a non-zero session pass their own. An empty candidate is end-of-candidates.
+   */
+  sendInfoCandidate(candidate: string, channelId = 0): void {
     this.sendSession("info", { candidate }, channelId);
   }
 
