@@ -108,10 +108,19 @@ describe("region rules", () => {
     expect(us.subprotocolPayload("S").region).toBe(WS_REGION_BY_SHARD["us-pr"]);
   });
 
-  it("serves the ie-pr (Ireland/CH) shard from the EU smart host with cluster EU", () => {
+  it("serves the ie-pr (Ireland/CH) shard from its own smart host with cluster EU", () => {
     const ie = client({ shard: "ie-pr", country: "CH" }).c;
-    expect(ie.signUrl).toBe("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign");
+    expect(ie.signUrl).toBe("https://security-smart-ie.eufylife.com/v1/smart/nvr/ws/sign");
     expect(ie.subprotocolPayload("S").region).toBe("EU");
+  });
+
+  it("derives a regional smart host + cluster for a shard not in the table", () => {
+    const de = client({ shard: "de-pr" as never, country: "DE" }).c;
+    expect(de.signUrl).toBe("https://security-smart-de.eufylife.com/v1/smart/nvr/ws/sign");
+    expect(de.subprotocolPayload("S").region).toBe("EU");
+    const us2 = client({ shard: "us-2" as never, country: "US" }).c;
+    expect(us2.signUrl).toContain("security-smart.eufylife.com");
+    expect(us2.subprotocolPayload("S").region).toBe("US");
   });
 
   it("hashes gtoken from the account user id, not the ap_cloud userId, and honors an explicit gtoken", async () => {
