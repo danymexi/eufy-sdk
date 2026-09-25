@@ -9,7 +9,7 @@
  *
  *   1. `GET https://<smart host>/v1/smart/nvr/ws/sign` with the mega token → a `sign` blob.
  *   2. WebSocket to `wss://<smart host>/v1/rtc/ws/join?reqtype=nvr`, subprotocols `["v1", <base64url
- *      JSON>]` carrying region, station serial, token, `gtoken = md5(user id)` and the sign. HTTP
+ *      JSON>]` carrying region, station serial, token, `gtoken` (md5 of the ACCOUNT user_id, not the ap_cloud one) and the sign. HTTP
  *      headers on the upgrade alone are refused — the JSON subprotocol is what authenticates.
  *   3. `action 1` auth on open; `action 3` session messages after: `scall` (start), `info` (SDP and
  *      trickle ICE), `ack`, `hangup`. Every session message carries an HMAC-SHA256 `account` over
@@ -28,18 +28,21 @@ import { EventEmitter } from "node:events";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { noopLogger, type Logger } from "../../core/logger.js";
 
-export type RtcRegionShard = "eu-pr" | "us-pr";
+export type RtcRegionShard = "eu-pr" | "ie-pr" | "us-pr";
 
 /** The signalling host per mega shard — the global one serves US, EU accounts have their own. */
 export const SMART_HOST_BY_SHARD: Readonly<Record<RtcRegionShard, string>> = {
   "us-pr": "security-smart.eufylife.com",
+  // The EU-family shards (Frankfurt eu-pr, Ireland ie-pr, …) are all served by the one EU smart host.
   "eu-pr": "security-smart-eu.eufylife.com",
+  "ie-pr": "security-smart-eu.eufylife.com",
 };
 
 /** The cluster name the WebSocket payload wants per shard. */
 export const WS_REGION_BY_SHARD: Readonly<Record<RtcRegionShard, string>> = {
   "us-pr": "US",
   "eu-pr": "EU",
+  "ie-pr": "EU",
 };
 
 export const RTC_WS_PATH = "/v1/rtc/ws/join?reqtype=nvr";
@@ -91,8 +94,19 @@ export type SignalingSocketFactory = (url: string, protocols: string[]) => Signa
 export interface RtcSignalingOptions {
   /** The mega session's auth token. */
   authToken: string;
-  /** The mega session's user id — `gtoken` is its md5. */
+  /**
+   * The mega session's user id — the `ap_cloud_user_id` the scall `account` HMAC and `subSn` path use.
+   * NOTE: this is NOT necessarily the id `gtoken` hashes — see `gtoken` / `accountUserId`.
+   */
   userId: string;
+  /**
+   * The eufy ACCOUNT user_id, whose md5 is the `gtoken` the portal sends. On accounts where the login
+   * reply carries a separate `ap_cloud_user_id`, this differs from {@link userId}, and hashing the wrong
+   * one is a silent sign rejection. Defaults to {@link userId}; overridden by an explicit {@link gtoken}.
+   */
+  accountUserId?: string;
+  /** The gtoken to send verbatim, when it is known directly (e.g. read from a live session). */
+  gtoken?: string;
   stationSn: string;
   /**
    * The camera the session is for, when it is a per-camera (live) session rather than the hub's own —
@@ -181,7 +195,7 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     this.smartHost = opts.smartHost ?? SMART_HOST_BY_SHARD[opts.shard];
     this.wsRegion = opts.wsRegion ?? WS_REGION_BY_SHARD[opts.shard];
     this.source = opts.source ?? "WEB";
-    this.gtoken = gtokenFromUserId(opts.userId);
+    this.gtoken = opts.gtoken ?? gtokenFromUserId(opts.accountUserId ?? opts.userId);
     this.fetchImpl = opts.fetch ?? fetch;
     this.createSocket =
       opts.createSocket ?? ((url, protocols) => new WebSocket(url, protocols) as unknown as SignalingSocket);
