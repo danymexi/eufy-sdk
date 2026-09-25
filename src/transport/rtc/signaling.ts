@@ -49,11 +49,14 @@ export function smartHostForShard(shard: string): string {
 }
 
 /** The cluster name the WebSocket payload wants per shard. */
-export const WS_REGION_BY_SHARD: Readonly<Record<RtcRegionShard, string>> = {
-  "us-pr": "US",
-  "eu-pr": "EU",
-  "ie-pr": "EU",
-};
+/**
+ * The cluster name the WebSocket subprotocol payload wants: the shard prefix uppercased. Verified
+ * live — an `ie-pr` account gets WS 101 with `"IE"` and 400 with `"EU"`, so this is NOT an EU-family
+ * grouping, it is the shard's own region letter (us-pr → US, eu-pr → EU, ie-pr → IE).
+ */
+export function wsRegionForShard(shard: string): string {
+  return (shard.split("-")[0] || "us").toUpperCase();
+}
 
 export const RTC_WS_PATH = "/v1/rtc/ws/join?reqtype=nvr";
 export const RTC_SIGN_PATH = "/v1/smart/nvr/ws/sign";
@@ -209,7 +212,7 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
   constructor(private readonly opts: RtcSignalingOptions) {
     super();
     this.smartHost = opts.smartHost ?? smartHostForShard(opts.shard);
-    this.wsRegion = opts.wsRegion ?? WS_REGION_BY_SHARD[opts.shard] ?? (opts.shard.startsWith("us") ? "US" : "EU");
+    this.wsRegion = opts.wsRegion ?? wsRegionForShard(opts.shard);
     this.source = opts.source ?? "WEB";
     this.gtoken = opts.gtoken ?? gtokenFromUserId(opts.accountUserId ?? opts.userId);
     this.fetchImpl = opts.fetch ?? fetch;
