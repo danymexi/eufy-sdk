@@ -6,13 +6,14 @@
  * @module model/capabilities
  */
 
-import type { Capability, CloudRecord, Codec, PropertyChange, PropertySpec } from "../types.js";
+import type { Capability, CloudRecord, Codec, PropertyChange, PropertySpec, WriteOnlySettingSpec } from "../types.js";
 import {
   bindMembers,
   hasRequiredCapabilities,
   installs,
   memberWrite,
   propertiesOf,
+  writeOnlySettingsOf,
   type MemberDeps,
 } from "./members.js";
 import { camelCase } from "./access.js";
@@ -210,6 +211,26 @@ export function mergeProperties(caps: Capability[], ctx?: AvailabilityContext): 
     // context the precomputed static list is used unchanged.
     const props = ctx && module.members ? propertiesOf(module.members, ctx) : module.properties;
     for (const spec of props) {
+      if (seen.has(spec.name)) continue;
+      seen.add(spec.name);
+      merged.push(spec);
+    }
+  }
+  return merged;
+}
+
+/**
+ * The write-only settings of a device's capabilities, merged the way {@link mergeProperties} merges the
+ * property schema: first capability to claim a name wins, and with a context each module's table is
+ * re-derived so the device's own gates decide what is listed.
+ */
+export function mergeWriteOnlySettings(caps: Capability[], ctx?: AvailabilityContext): WriteOnlySettingSpec[] {
+  const seen = new Set<string>();
+  const merged: WriteOnlySettingSpec[] = [];
+  for (const cap of caps) {
+    const module = getCapabilityModule(cap);
+    if (!module?.members) continue;
+    for (const spec of writeOnlySettingsOf(module.members, ctx)) {
       if (seen.has(spec.name)) continue;
       seen.add(spec.name);
       merged.push(spec);

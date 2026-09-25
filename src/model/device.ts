@@ -22,6 +22,7 @@ import type {
   PropertyChange,
   PropertyValueType,
   PropertySpec,
+  WriteOnlySettingSpec,
   PropertyValue,
   ResolvedDevice,
 } from "./types.js";
@@ -149,6 +150,12 @@ export class Device {
   /** Merged property schema (one entry per known property this device exposes). */
   properties!: readonly PropertySpec[];
   /**
+   * Settings this device ACCEPTS but never reports back — settable through `setProperty`, absent from
+   * {@link properties} because there is no reported value to publish. A consumer surfacing one owns its
+   * displayed state; see {@link WriteOnlySettingSpec}.
+   */
+  writeOnlySettings!: readonly WriteOnlySettingSpec[];
+  /**
    * What the user named this device in the app (`device_name`), falling back to {@link modelName} when
    * the record carries none.
    */
@@ -230,6 +237,7 @@ export class Device {
     this.codec = resolved.codec;
     this.capabilities = resolved.capabilities;
     this.properties = resolved.properties;
+    this.writeOnlySettings = resolved.writeOnlySettings;
     this.modelName = resolved.name;
     this.name = this.deviceName ?? resolved.name;
     this.source = resolved.source;

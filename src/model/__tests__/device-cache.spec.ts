@@ -7,6 +7,7 @@ const RESOLVED: ResolvedDevice = {
   codec: "camera",
   capabilities: ["battery"],
   properties: [{ name: "battery", paramType: 1101, type: "number", writable: false }],
+  writeOnlySettings: [],
   name: "cam",
   source: "model",
 };

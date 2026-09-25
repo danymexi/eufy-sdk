@@ -26,7 +26,7 @@ import {
 import { describedAction, readBool, readNum, readStr } from "./access.js";
 import type { ActionArgSpec, ActionSpec, AvailabilityContext, CapabilityStateReader, CommandContext } from "./types.js";
 import type { Capability } from "../types.js";
-import type { PropertySpec, PropertyValueType, ValueKind } from "../types.js";
+import type { PropertySpec, PropertyValueType, ValueKind, WriteOnlySettingSpec } from "../types.js";
 
 // ── the contract ────────────────────────────────────────────────────────────────────────────────
 
@@ -628,6 +628,39 @@ export function propertiesOf(members: Members, ctx?: AvailabilityContext): Prope
         raw: m.decode ? true : undefined,
         readAliases: aliases?.slice(promoted ? 1 : 0).map(({ paramType, invert }) => ({ paramType, invert })),
         writable: m.write !== undefined || m.writtenElsewhere === true,
+        description: m.description,
+      },
+    ];
+  });
+}
+
+/**
+ * The write-only settings a members table declares: everything {@link propertiesOf} deliberately drops.
+ *
+ * Only members that actually install a write are listed — a member declared `writeOnly` without one
+ * documents the device but cannot be set, so publishing it would advertise a control that does nothing.
+ * The gates are the SETTER's, not the getter's: a member's own `available`, plus the evidence its
+ * `requires` names, which is what decides whether the fluent setter exists at all. Without `ctx` the
+ * gates cannot be evaluated and every write-only member is listed, matching how `propertiesOf` treats
+ * its own static case.
+ */
+export function writeOnlySettingsOf(members: Members, ctx?: AvailabilityContext): WriteOnlySettingSpec[] {
+  return Object.entries(members).flatMap(([name, m]) => {
+    if (!("type" in m) || !m.writeOnly || m.write === undefined) return [];
+    if (ctx && !reports(m.requires, ctx as CommandContext)) return [];
+    if (ctx && m.available && !m.available(ctx)) return [];
+    const { values: enumValues } = resolvedEnum(m, ctx);
+    return [
+      {
+        name: m.property ?? name,
+        paramType: m.param,
+        type: m.type,
+        kind: m.kind,
+        unit: m.unit,
+        min: m.min,
+        max: m.max,
+        enumValues,
+        provenance: m.provenance,
         description: m.description,
       },
     ];

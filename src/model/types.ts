@@ -253,6 +253,44 @@ export interface PropertySpec {
 }
 
 /**
+ * A setting the device ACCEPTS but never reports back — the write-only half of a capability's members.
+ *
+ * Deliberately NOT a {@link PropertySpec}: that schema describes what a device REPORTS, and these have
+ * no reported value to publish, so listing them there would promise a read that can only ever answer
+ * `undefined`. They are published separately because a consumer still has to DISCOVER them: a HomeBase
+ * alarm volume is settable on every station and shows in the eufy app, but without this list an
+ * integration cannot know it exists, what unit it carries, or which values it accepts — it can only
+ * hardcode the name. The write itself already works, through `setProperty(sn, name, value)`.
+ *
+ * A consumer that surfaces one of these owns its displayed state: the device will not confirm the
+ * value, so the honest presentation is an optimistic one (remember what was last written), never a
+ * read-back.
+ */
+export interface WriteOnlySettingSpec {
+  /** Stable, code-facing name — the one `setProperty` takes. */
+  name: string;
+  /**
+   * The eufy P2P `param_type` the write carries, when the write IS a param. Absent for a member whose
+   * write is not one — camera privacy is a frame burst, built from an id owned by the transport.
+   */
+  paramType?: number;
+  type: PropertyValueType;
+  /** What the value means — the machine-readable half of {@link unit}. */
+  kind?: ValueKind;
+  /** Human unit, when meaningful (e.g. "%"). */
+  unit?: string;
+  /** Inclusive bounds for a numeric setting, when the domain is known. */
+  min?: number;
+  max?: number;
+  /** Allowed values for an enum setting (raw → label). */
+  enumValues?: Record<number, string>;
+  /** Trust level of this mapping, same scale as {@link PropertySpec.provenance}. */
+  provenance?: PropertySource;
+  /** Short description for docs / discovery. */
+  description?: string;
+}
+
+/**
  * A decoded property value. Most params are scalar, but some carry a structured payload that the
  * device delivers **encoded** (base64-wrapped JSON, or a JSON string) — e.g. motion-detection
  * zones, privacy zones, guard-mode configs. Those are decoded to the object/array form.
@@ -370,6 +408,11 @@ export interface ResolvedDevice {
   capabilities: Capability[];
   /** Merged, de-duplicated property schema from all resolved capabilities. */
   properties: PropertySpec[];
+  /**
+   * Merged, de-duplicated write-only settings from all resolved capabilities — settable, never
+   * reported, and absent from {@link properties} for that reason. See {@link WriteOnlySettingSpec}.
+   */
+  writeOnlySettings: WriteOnlySettingSpec[];
   /** Display name (curated row → inferred → model code). */
   name: string;
   /** How the codec/caps were resolved, for diagnostics. */
