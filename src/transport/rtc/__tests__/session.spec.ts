@@ -204,6 +204,19 @@ describe("RtcSession", () => {
     expect(closed).toHaveBeenCalledTimes(1);
   });
 
+  it("stops reporting connected when the command channel closes under a live peer", async () => {
+    const s = await authenticated(setup());
+    const closed = vi.fn();
+    s.session.on("close", closed);
+    s.peer.emit("commandChannelOpen");
+    expect(s.session.isConnected).toBe(true);
+    s.peer.emit("commandChannelClosed");
+    expect(s.session.isConnected).toBe(false);
+    expect(closed).toHaveBeenCalledTimes(1);
+    s.peer.emit("commandChannelClosed");
+    expect(closed).toHaveBeenCalledTimes(1);
+  });
+
   it("surfaces a handler failure as an error instead of an unhandled rejection", async () => {
     const s = await authenticated(setup());
     s.peer.init.mockRejectedValueOnce(new Error("no native module"));

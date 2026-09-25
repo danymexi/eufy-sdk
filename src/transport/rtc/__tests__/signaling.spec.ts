@@ -242,6 +242,14 @@ describe("socket handshake", () => {
     expect(seen).toEqual([inner, { action: 1, code: 200 }]);
   });
 
+  it("settles connect() when the socket closes before it ever opened", async () => {
+    const { c, sockets } = client();
+    const connecting = c.connect();
+    const s = await socketOf(sockets);
+    s.close();
+    await expect(connecting).rejects.toThrow(/closed before open/);
+  });
+
   it("refuses to send before the socket is open and reports a closed socket", async () => {
     const { c, sockets } = client();
     expect(() => c.sendCall()).toThrow(/not connected/);

@@ -21,9 +21,10 @@ class FakeDc implements NativeDataChannel {
   isOpen(): boolean {
     return this.open;
   }
+  sendResult = true;
   sendMessageBinary(buffer: Buffer | Uint8Array): boolean {
     this.sent.push(Buffer.from(buffer));
-    return true;
+    return this.sendResult;
   }
   close(): void {
     this.open = false;
@@ -46,6 +47,10 @@ class FakeDc implements NativeDataChannel {
   }
   fireMessage(msg: Buffer): void {
     (this.cbs.message as ((m: Buffer) => void) | undefined)?.(msg);
+  }
+  fireClosed(): void {
+    this.open = false;
+    (this.cbs.closed as (() => void) | undefined)?.();
   }
 }
 
@@ -248,6 +253,51 @@ describe("RtcPeer", () => {
     peer.close();
     expect(pc().closed).toBe(true);
     expect(peer.isCommandChannelReady).toBe(false);
+  });
+
+  it("rejects a pending local answer when the peer is closed instead of dropping it", async () => {
+    const { peer } = setup();
+    await peer.init();
+    const answering = peer.handleRemoteOffer(OFFER);
+    peer.close();
+    await expect(answering).rejects.toThrow(/closed while waiting for the local SDP answer/);
+  });
+
+  it("announces the command channel closing so a caller stops believing it is ready", async () => {
+    const { peer, pc } = setup();
+    await peer.init();
+    const answering = peer.handleRemoteOffer(OFFER);
+    pc().fireLocalAnswer(ANSWER);
+    await answering;
+    const cmd = pc().channels.find((c) => c.label === COMMAND_CHANNEL)!;
+    cmd.fireOpen();
+    await vi.waitFor(() => expect(peer.isCommandChannelReady).toBe(true));
+    const closed = vi.fn();
+    peer.on("commandChannelClosed", closed);
+    // a non-command channel closing says nothing about the session
+    pc()
+      .channels.find((c) => c.label === "notify")!
+      .fireClosed();
+    expect(closed).not.toHaveBeenCalled();
+    cmd.fireClosed();
+    expect(closed).toHaveBeenCalledTimes(1);
+    expect(peer.isCommandChannelReady).toBe(false);
+    cmd.fireClosed();
+    expect(closed).toHaveBeenCalledTimes(1); // once, not per event
+  });
+
+  it("reports a refused native send as a failed command instead of a silent success", async () => {
+    const { peer, pc } = setup();
+    await peer.init();
+    const answering = peer.handleRemoteOffer(OFFER);
+    pc().fireLocalAnswer(ANSWER);
+    await answering;
+    const cmd = pc().channels.find((c) => c.label === COMMAND_CHANNEL)!;
+    cmd.fireOpen();
+    await vi.waitFor(() => expect(peer.isCommandChannelReady).toBe(true));
+    expect(peer.sendCommand(Buffer.from("XZYHok----------"))).toBe(true);
+    cmd.sendResult = false; // the native channel refuses the wire packet
+    expect(peer.sendCommand(Buffer.from("XZYHrefused-----"))).toBe(false);
   });
 
   it("refuses to work before init and to handle two offers at once", async () => {

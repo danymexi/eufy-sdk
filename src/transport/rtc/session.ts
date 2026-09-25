@@ -112,6 +112,14 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       this.logger.debug(`[rtc] ${this.opts.stationSn} command channel open`);
       this.emit("connected");
     });
+    // The command channel IS the session: if it goes, stop reporting connected even when the peer
+    // connection itself is still nominally up.
+    this.peer.on("commandChannelClosed", () => {
+      if (!this.connected || this.closed) return;
+      this.connected = false;
+      this.logger.debug(`[rtc] ${this.opts.stationSn} command channel closed`);
+      this.emit("close");
+    });
     this.peer.on("connectionState", (state) => {
       if ((state === "failed" || state === "closed") && this.connected && !this.closed) {
         this.connected = false;
