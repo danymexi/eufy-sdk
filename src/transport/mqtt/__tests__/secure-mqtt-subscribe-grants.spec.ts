@@ -69,10 +69,7 @@ describe("SecureMqtt.subscribeDevice — partial-denial grants", () => {
       const err = Object.assign(new Error("Unspecified error"), {
         packet: { granted: [{ topic: topics[0], qos: 1 }] },
       });
-      const err2 = Object.assign(new Error("Unspecified error"), {
-        packet: { granted: [{ topic: topics[0], qos: 1 }] },
-      });
-      cb(err2, undefined);
+      cb(err, undefined);
     });
     await expect(m.subscribe(["state/leg", "ota/leg"])).resolves.toEqual(["state/leg"]);
   });
