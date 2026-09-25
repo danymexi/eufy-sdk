@@ -99,7 +99,13 @@ export interface SignalingSocket {
   addEventListener(type: "open" | "message" | "close" | "error", listener: (ev: SignalingSocketEvent) => void): void;
 }
 
-export type SignalingSocketFactory = (url: string, protocols: string[]) => SignalingSocket;
+export interface SignalingSocketInit {
+  /** The subprotocols; slot 2 carries the base64url auth JSON. */
+  protocols: string[];
+  /** The upgrade Origin — the portal sends it and the server checks it, like the sign call. */
+  origin: string;
+}
+export type SignalingSocketFactory = (url: string, init: SignalingSocketInit) => SignalingSocket;
 
 export interface RtcSignalingOptions {
   /** The mega session's auth token. */
@@ -208,7 +214,14 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     this.gtoken = opts.gtoken ?? gtokenFromUserId(opts.accountUserId ?? opts.userId);
     this.fetchImpl = opts.fetch ?? fetch;
     this.createSocket =
-      opts.createSocket ?? ((url, protocols) => new WebSocket(url, protocols) as unknown as SignalingSocket);
+      opts.createSocket ??
+      ((url, init) =>
+        // Node's global WebSocket (undici) takes an options object with `headers`; browsers send Origin
+        // for us, Node does not, and the smart host rejects the upgrade without it.
+        new WebSocket(url, {
+          protocols: init.protocols,
+          headers: { Origin: init.origin },
+        } as unknown as string[]) as unknown as SignalingSocket);
     this.logger = opts.logger ?? noopLogger;
     this.now = opts.now ?? Date.now;
     this.makeMsgId = opts.makeMsgId ?? (() => randomUUID().replace(/-/g, ""));
@@ -281,7 +294,7 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
         reject(new Error(`RTC signalling connect timeout after ${timeoutMs}ms`));
         this.close();
       }, timeoutMs);
-      const ws = this.createSocket(this.wsUrl, protocols);
+      const ws = this.createSocket(this.wsUrl, { protocols, origin: PORTAL_ORIGIN });
       this.ws = ws;
       ws.addEventListener("open", () => {
         clearTimeout(timer);
@@ -302,9 +315,11 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
         this.logger.debug(`[rtc] ${this.opts.stationSn} signalling closed ${code} ${reason}`);
         this.emit("close", code, reason);
       });
-      ws.addEventListener("error", () => {
+      ws.addEventListener("error", (ev) => {
         clearTimeout(timer);
-        reject(new Error("RTC signalling socket error"));
+        const detail = (ev as { error?: { message?: string; code?: string }; message?: string } | undefined) ?? {};
+        const cause = detail.error?.message ?? detail.error?.code ?? detail.message ?? "";
+        reject(new Error(`RTC signalling socket error${cause ? ": " + cause : ""}`));
       });
     });
   }
