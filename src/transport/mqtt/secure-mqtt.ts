@@ -198,10 +198,33 @@ export class SecureMqtt extends EventEmitter implements RealtimeTransport {
    * topic is reported via `error` naming the credential scope; only an all-denied device throws, so a
    * line that grants its state channel but refuses (say) the OTA leg still works.
    */
+  /**
+   * Subscribe and return the SUBACK grants, whatever the broker allows.
+   *
+   * `subscribeAsync` (the Promise form) REJECTS on any `0x80` grant in mqtt.js 5.x — so a device whose
+   * line grants its state channel but is refused one leg loses ITS WHOLE realtime subscription and falls
+   * back to the slow poll. The callback form still hands over the granted array (and, on some builds,
+   * carries it on `err.packet.granted`), so read the grants from there and let {@link partitionGrants}
+   * apply the real policy: a partial denial is not a failure of the whole subscribe.
+   */
+  private subscribeGrants(topics: string[]): Promise<ReadonlyArray<{ topic: string; qos: number }>> {
+    return new Promise((resolve, reject) => {
+      if (!this.client) return reject(new Error("SecureMqtt not connected"));
+      this.client.subscribe(topics, { qos: 1 }, (err, granted) => {
+        const fromErr = (err as { packet?: { granted?: Array<{ topic: string; qos: number }> } } | null)?.packet
+          ?.granted;
+        const grants = granted?.length ? granted : fromErr;
+        if (grants?.length) return resolve(grants);
+        if (err) return reject(err);
+        resolve([]);
+      });
+    });
+  }
+
   async subscribeDevice(device: EufyDevice): Promise<void> {
     if (!this.client) throw new Error("SecureMqtt not connected");
     const topics = [...subscribeTopics(device)];
-    const { denied } = this.partitionGrants(await this.client.subscribeAsync(topics, { qos: 1 }));
+    const { denied } = this.partitionGrants(await this.subscribeGrants(topics));
     const scope = this.o.credentials.app_name ?? "default";
     if (denied.length === topics.length) {
       throw new Error(
@@ -222,7 +245,7 @@ export class SecureMqtt extends EventEmitter implements RealtimeTransport {
    */
   async subscribe(topics: string[]): Promise<string[]> {
     if (!this.client) throw new Error("SecureMqtt not connected");
-    return this.partitionGrants(await this.client.subscribeAsync(topics, { qos: 1 })).granted;
+    return this.partitionGrants(await this.subscribeGrants(topics)).granted;
   }
 
   /**
