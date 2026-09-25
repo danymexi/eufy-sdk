@@ -4,12 +4,18 @@
  * (`libsctp`, "SCTP Version V1.0.3") observed offline: frames of 0–16 000 bytes pushed in, the packets
  * that came out, and what the receiving side reassembled from them. Nothing of that module ships here.
  *
- * Every wire packet is the same size, `28 + maxPacketBytes` (the portal uses 800 → 828), zero-padded:
+ * Every wire packet is the same size, `28 + maxPacketBytes`, zero-padded. The live portal sends 1000 →
+ * 1028-byte packets; the offline vectors were taken at 800, and the receiver accepts either, since the
+ * size is carried per packet:
  *
  *   0   "PTCS"
  *   4   u8   3              constant — protocol version, as far as the vectors show
  *   5   u8   channel        the SCTP channel the frame belongs to: 0 command, 2 notify, 3 file, 4 playback, 5 live
- *   6   u16  0
+ *   6   u16  sequence       a FRAME counter: every packet of a frame carries the same value, and it
+ *                           steps once per frame. Both sources agree — the live portal sent 25, 26, 27
+ *                           on three consecutive one-packet frames, and in the offline vectors each
+ *                           frame's packets all carry the generator's starting 0, which a per-PACKET
+ *                           counter could not produce.
  *   8   u32  frame id       one value per frame, shared by all its packets — the portal uses a ms clock
  *   12  u32  frame length   total bytes of the frame
  *   16  u16  packet index   0-based position of this packet in the frame
@@ -28,8 +34,11 @@ import type { PortalFramer } from "./framer.js";
 
 const MAGIC = Buffer.from("PTCS", "ascii");
 export const PTCS_HEADER_LENGTH = 28;
-/** The portal's packet payload size; the hub's command path is measured stable at this. */
-export const PTCS_DEFAULT_PAYLOAD_BYTES = 800;
+/**
+ * The portal's packet payload size, read off its own wire: every packet it sends on the command channel
+ * is 1028 bytes, i.e. 1000 of payload after the 28-byte header.
+ */
+export const PTCS_DEFAULT_PAYLOAD_BYTES = 1000;
 const FLAG_BASE = 0x4000;
 const FLAG_LAST = 0x0400;
 const LENGTH_MASK = 0x03ff;
@@ -63,6 +72,8 @@ export function linkTypeForChannel(channel: number): number {
 
 export interface PtcsHeader {
   channel: number;
+  /** The sender's running packet counter — see the header map. */
+  sequence: number;
   frameId: number;
   frameLength: number;
   index: number;
@@ -75,6 +86,7 @@ export function parsePtcsHeader(packet: Buffer): PtcsHeader | undefined {
   const flags = packet.readUInt16LE(18);
   return {
     channel: packet[5]!,
+    sequence: packet.readUInt16LE(6),
     frameId: packet.readUInt32LE(8),
     frameLength: packet.readUInt32LE(12),
     index: packet.readUInt16LE(16),
@@ -84,11 +96,15 @@ export function parsePtcsHeader(packet: Buffer): PtcsHeader | undefined {
 }
 
 /** Split one frame into wire packets. */
-export function packetize(frame: Buffer, opts: { channel?: number; frameId: number; payloadBytes?: number }): Buffer[] {
+export function packetize(
+  frame: Buffer,
+  opts: { channel?: number; frameId: number; payloadBytes?: number; sequence?: number },
+): Buffer[] {
   const size = opts.payloadBytes ?? PTCS_DEFAULT_PAYLOAD_BYTES;
   if (size <= 0 || size > LENGTH_MASK) throw new RangeError(`PTCS payload size ${size} out of range`);
   const channel = opts.channel ?? PtcsChannel.COMMAND;
   const count = Math.max(1, Math.ceil(frame.length / size));
+  const sequence = (opts.sequence ?? 0) & 0xffff;
   const packets: Buffer[] = [];
   for (let i = 0; i < count; i++) {
     const chunk = frame.subarray(i * size, Math.min(frame.length, (i + 1) * size));
@@ -97,6 +113,7 @@ export function packetize(frame: Buffer, opts: { channel?: number; frameId: numb
     MAGIC.copy(packet, 0);
     packet[4] = 3;
     packet[5] = channel & 0xff;
+    packet.writeUInt16LE(sequence, 6);
     packet.writeUInt32LE(opts.frameId >>> 0, 8);
     packet.writeUInt32LE(frame.length >>> 0, 12);
     packet.writeUInt16LE(i, 16);
@@ -186,6 +203,8 @@ export function frameIdClock(now: () => number = Date.now): () => number {
 
 export interface PtcsFramerOptions {
   payloadBytes?: number;
+  /** Where the frame counter starts; the portal's was mid-run when it was observed. */
+  sequence?: number;
   staleMs?: number;
   nextFrameId?: () => number;
   now?: () => number;
@@ -199,9 +218,11 @@ export class PtcsFramer implements PortalFramer {
   private sweep?: NodeJS.Timeout;
   private ready = false;
   private readonly nextFrameId: () => number;
+  private sequence: number;
 
   constructor(private readonly opts: PtcsFramerOptions = {}) {
     this.nextFrameId = opts.nextFrameId ?? frameIdClock(opts.now);
+    this.sequence = (opts.sequence ?? 0) & 0xffff;
   }
 
   async init(
@@ -225,12 +246,13 @@ export class PtcsFramer implements PortalFramer {
 
   sendFrame(portalPacket: Buffer): void {
     if (!this.ready) throw new Error("PTCS framer not initialised");
-    for (const packet of packetize(portalPacket, {
+    const packets = packetize(portalPacket, {
       frameId: this.nextFrameId(),
       payloadBytes: this.opts.payloadBytes,
-    })) {
-      this.onWire?.(packet);
-    }
+      sequence: this.sequence,
+    });
+    this.sequence = (this.sequence + 1) & 0xffff;
+    for (const packet of packets) this.onWire?.(packet);
   }
 
   recvPacket(wirePacket: Buffer): void {

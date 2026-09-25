@@ -102,3 +102,16 @@ export function forceDtlsRole(sdp: string, role: "active" | "passive"): string {
     return sdp.replace(/a=setup:(active|passive|actpass)/g, `a=setup:${role}`);
   return sdp.replace(/(m=application[^\r\n]*\r?\n)/, `$1a=setup:${role}\r\n`);
 }
+
+/**
+ * The wire form of a trickled ICE candidate: `candidate:...`, the shape the hub itself sends.
+ *
+ * libdatachannel hands out the SDP attribute line (`a=candidate:...`), and the portal protocol carries
+ * the attribute's VALUE — the hub's own `info` messages arrive as `candidate:1 1 udp … typ host`, and
+ * the candidate array inside a scall body drops the `candidate:` too. Sending the raw `a=` line makes
+ * every trickled candidate unparseable to the hub; a session survives it only because the scall body
+ * already carried the gathered set.
+ */
+export function toWireCandidate(candidate: string): string {
+  return candidate.trim().replace(/^a=/, "");
+}

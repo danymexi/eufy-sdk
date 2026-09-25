@@ -174,24 +174,27 @@ describe("RtcPeer", () => {
     pc().fireLocalAnswer(ANSWER);
     const answer = await answering;
     expect(answer).toContain(`a=max-message-size:${ANKER_MAX_MESSAGE_SIZE}`);
-    expect(pc().channels.map((c) => c.config?.id)).toEqual([1, 3, 5, 7, 9, 11]);
+    expect(pc().channels.map((c) => c.config?.id)).toEqual([0, 2, 4, 6, 8, 10]);
+    expect(pc().remote?.sdp).toContain("a=setup:passive"); // we pin the hub passive, so we answer active
     expect(JSON.parse(peer.answerAsScallJson(answer))).toEqual({
       setup: "passive",
       ice: { ufrag: "x", pwd: "y", fingerprint_type: "sha-256", fingerprint: "aabb" },
     });
   });
 
-  it("keeps libdatachannel's own DTLS role, and pins the portal's odd stream ids", async () => {
-    // libdatachannel answers the hub's `actpass` with `passive`, so we are the DTLS server and the odd
-    // ids of the portal are the ones RFC 8832 gives us. Rewriting the announced role does NOT change the
-    // role libdatachannel plays, so it stays opt-in; live, announcing a role we do not play never
-    // completes DTLS. `auto` is the escape hatch that lets libdatachannel number the channels.
-    const auto = setup();
-    await auto.peer.init();
-    const autoAnswering = auto.peer.handleRemoteOffer(OFFER);
-    expect(auto.pc().channels.map((c) => c.config?.id)).toEqual([1, 3, 5, 7, 9, 11]);
-    auto.pc().fireLocalAnswer(ANSWER);
-    await autoAnswering;
+  it("pins our DTLS role by pinning the complement into the hub's offer, not by editing the answer", async () => {
+    // The role has to be pinned where it is DECIDED. Rewriting our own answer changes only what we
+    // announce, never the role libdatachannel plays, and announcing a role we are not playing deadlocks
+    // the handshake. Pinning the offer leaves exactly one legal answer, so the two always agree.
+    // The default is `active` — the role the portal plays, and the one whose even stream ids the hub
+    // pairs with.
+    const dflt = setup();
+    await dflt.peer.init();
+    const a = dflt.peer.handleRemoteOffer(OFFER);
+    expect(dflt.pc().remote?.sdp).toContain("a=setup:passive");
+    expect(dflt.pc().channels.map((c) => c.config?.id)).toEqual([0, 2, 4, 6, 8, 10]);
+    dflt.pc().fireLocalAnswer(ANSWER);
+    await a;
 
     let loose!: FakePc;
     const peer = new RtcPeer({
@@ -199,13 +202,14 @@ describe("RtcPeer", () => {
       createFramer: () => new PassthroughFramer(),
       answerTimeoutMs: 200,
       dataChannelIds: "auto",
-      dtlsRole: "active",
+      dtlsRole: undefined, // leave the hub's actpass alone
     });
     await peer.init();
     const answering = peer.handleRemoteOffer(OFFER);
+    expect(loose.remote?.sdp).toContain("a=setup:actpass");
     expect(loose.channels.map((c) => c.config?.id)).toEqual(new Array(DATA_CHANNEL_LABELS.length).fill(undefined));
     loose.fireLocalAnswer(ANSWER);
-    expect(await answering).toContain("a=setup:active");
+    await answering;
   });
 
   it("uses an answer libdatachannel already produced, and times out when it never does", async () => {
