@@ -33,10 +33,20 @@ export type RtcRegionShard = "eu-pr" | "ie-pr" | "us-pr";
 /** The signalling host per mega shard — the global one serves US, EU accounts have their own. */
 export const SMART_HOST_BY_SHARD: Readonly<Record<RtcRegionShard, string>> = {
   "us-pr": "security-smart.eufylife.com",
-  // The EU-family shards (Frankfurt eu-pr, Ireland ie-pr, …) are all served by the one EU smart host.
   "eu-pr": "security-smart-eu.eufylife.com",
-  "ie-pr": "security-smart-eu.eufylife.com",
+  // Ireland has its OWN smart host, not the eu one — verified 200/bizcode 0 on a live CH account.
+  "ie-pr": "security-smart-ie.eufylife.com",
 };
+
+/**
+ * The smart host for a shard, deriving `security-smart-<prefix>` for any shard not in the table (us is
+ * the bare host). So a shard we have not seen still gets its regional host instead of failing.
+ */
+export function smartHostForShard(shard: string): string {
+  if (shard in SMART_HOST_BY_SHARD) return SMART_HOST_BY_SHARD[shard as RtcRegionShard];
+  const prefix = shard.split("-")[0]?.toLowerCase();
+  return !prefix || prefix === "us" ? "security-smart.eufylife.com" : `security-smart-${prefix}.eufylife.com`;
+}
 
 /** The cluster name the WebSocket payload wants per shard. */
 export const WS_REGION_BY_SHARD: Readonly<Record<RtcRegionShard, string>> = {
@@ -192,8 +202,8 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
 
   constructor(private readonly opts: RtcSignalingOptions) {
     super();
-    this.smartHost = opts.smartHost ?? SMART_HOST_BY_SHARD[opts.shard];
-    this.wsRegion = opts.wsRegion ?? WS_REGION_BY_SHARD[opts.shard];
+    this.smartHost = opts.smartHost ?? smartHostForShard(opts.shard);
+    this.wsRegion = opts.wsRegion ?? WS_REGION_BY_SHARD[opts.shard] ?? (opts.shard.startsWith("us") ? "US" : "EU");
     this.source = opts.source ?? "WEB";
     this.gtoken = opts.gtoken ?? gtokenFromUserId(opts.accountUserId ?? opts.userId);
     this.fetchImpl = opts.fetch ?? fetch;
