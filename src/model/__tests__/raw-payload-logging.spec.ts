@@ -21,6 +21,7 @@ const RESOLVED: ResolvedDevice = {
     { name: "sideBrushHours", paramType: 168, type: "number", writable: false, raw: true },
     { name: "battery", paramType: 163, type: "number", writable: false },
   ],
+  writeOnlySettings: [],
   name: "vac",
   source: "model",
 };

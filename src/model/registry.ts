@@ -27,9 +27,11 @@
  */
 
 import type { CloudRecord, RegistryEntry, ResolvedDevice, Capability, Codec, PropertySpec } from "./types.js";
+import type { AvailabilityContext } from "./capabilities/types.js";
 import { classify, codecForType, codecFromModel } from "./classify.js";
 import {
   mergeProperties,
+  mergeWriteOnlySettings,
   detectCapabilities,
   codecBaseline,
   STATION_OWNED_CAPABILITIES,
@@ -223,6 +225,7 @@ export function resolveDevice(rec: CloudRecord): ResolvedDevice {
   ]).filter((c) => !(attached && STATION_OWNED_CAPABILITIES.has(c)));
 
   const properties = resolveProperties(rec, codec, capabilities);
+  const writeOnlySettings = mergeWriteOnlySettings(capabilities, availabilityContext(rec, codec, capabilities));
 
   // Name: curated → inferred clean T-code → raw model → "unknown".
   const name = row?.name ?? inferName(rec) ?? rec.model ?? "unknown";
@@ -233,7 +236,7 @@ export function resolveDevice(rec: CloudRecord): ResolvedDevice {
     codecFromModel(rec.model) !== undefined;
   const source: ResolvedDevice["source"] = row ? "model" : classifiedByCategory ? "category" : "inferred";
 
-  return { codec, capabilities, properties, name, source };
+  return { codec, capabilities, properties, writeOnlySettings, name, source };
 }
 
 /**
@@ -244,6 +247,15 @@ export function resolveDevice(rec: CloudRecord): ResolvedDevice {
  * fields a live session hasn't produced.
  */
 export function resolveProperties(rec: CloudRecord, codec: Codec, capabilities: Capability[]): PropertySpec[] {
+  return mergeProperties(capabilities, availabilityContext(rec, codec, capabilities));
+}
+
+/**
+ * The context both manifests are derived from — the property schema and the write-only settings beside
+ * it. One builder so a family gate and a per-model enum are decided from the same truthful view on
+ * every path, and so the two lists can never disagree about what a device is.
+ */
+function availabilityContext(rec: CloudRecord, codec: Codec, capabilities: Capability[]): AvailabilityContext {
   const paramIds = new Set<number>();
   if (rec.params && typeof rec.params === "object") {
     for (const k of Object.keys(rec.params)) {
@@ -251,12 +263,12 @@ export function resolveProperties(rec: CloudRecord, codec: Codec, capabilities: 
       if (Number.isFinite(n)) paramIds.add(n);
     }
   }
-  return mergeProperties(capabilities, {
+  return {
     codec,
     deviceType: rec.deviceType,
     model: rec.model,
     category: rec.category,
     capabilities: new Set(capabilities),
     paramIds,
-  });
+  };
 }
