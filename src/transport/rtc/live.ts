@@ -25,7 +25,14 @@ import { EventEmitter } from "node:events";
 import type { LiveVideoFrame, LiveStreamConsumer } from "../../core/contracts.js";
 import type { Logger } from "../../core/logger.js";
 import type { RtcSession } from "./session.js";
-import { buildPortalPacket, parsePortalHeader, PORTAL_HEADER_LENGTH, PortalLinkType, type SegmentCounter } from "./portal-packet.js";
+import {
+  buildPortalPacket,
+  parsePortalHeader,
+  parsePortalPacket,
+  PORTAL_HEADER_LENGTH,
+  PortalLinkType,
+  type SegmentCounter,
+} from "./portal-packet.js";
 import { PORTAL_CMD_SET_PAYLOAD, PORTAL_STATION_CHANNEL } from "./commands.js";
 
 export const T9000Live = {
@@ -37,6 +44,9 @@ export const T9000Live = {
   MEDIA: 1300,
   /** Media packet channel = this + the camera's `device_channel`. */
   MEDIA_CHANNEL_BASE: 100,
+  /** The play slot a single-camera live streams on: the hub answers on MEDIA_CHANNEL_BASE + PLAY_ID
+   * regardless of the camera's own device channel (verified: a camera on device_channel 5 streams on 101). */
+  PLAY_ID: 1,
   /** Portal packet id of the raw keepalive. */
   KEEPALIVE: 1139,
   KEEPALIVE_MS: 29_000,
@@ -45,15 +55,33 @@ export const T9000Live = {
 } as const;
 
 /** The portal's 36-byte data-channel keepalive, byte for byte (20-byte prefix + bare `XZYH 1139`). */
-export const T9000_KEEPALIVE = Buffer.from("0009000010000000000000006300000000000000585a5948730400000000000000000002", "hex");
+export const T9000_KEEPALIVE = Buffer.from(
+  "0009000010000000000000006300000000000000585a5948730400000000000000000002",
+  "hex",
+);
 
 /** The three commands the portal sends before a start; replayed as captured. */
 export function buildT9000LivePrelude(opts: { accountId: string; seg: SegmentCounter }): Buffer[] {
   const { accountId, seg } = opts;
   return [
-    buildPortalPacket({ commandId: PORTAL_CMD_SET_PAYLOAD, channel: PORTAL_STATION_CHANNEL, segment: seg.next(), payload: { account_id: accountId, cmd: 1103, payload: {} } }),
-    buildPortalPacket({ commandId: PORTAL_CMD_SET_PAYLOAD, channel: PORTAL_STATION_CHANNEL, segment: seg.next(), payload: { account_id: accountId, cmd: 9100, payload: {} } }),
-    buildPortalPacket({ commandId: 9257, channel: 0, segment: seg.next(), payload: { value: 0, value1: 0, account_id: accountId } }),
+    buildPortalPacket({
+      commandId: PORTAL_CMD_SET_PAYLOAD,
+      channel: PORTAL_STATION_CHANNEL,
+      segment: seg.next(),
+      payload: { account_id: accountId, cmd: 1103, payload: {} },
+    }),
+    buildPortalPacket({
+      commandId: PORTAL_CMD_SET_PAYLOAD,
+      channel: PORTAL_STATION_CHANNEL,
+      segment: seg.next(),
+      payload: { account_id: accountId, cmd: 9100, payload: {} },
+    }),
+    buildPortalPacket({
+      commandId: 9257,
+      channel: 0,
+      segment: seg.next(),
+      payload: { value: 0, value1: 0, account_id: accountId },
+    }),
   ];
 }
 
@@ -204,14 +232,20 @@ export class RtcLive {
   private started = false;
   private keepalive?: ReturnType<typeof setInterval>;
   private readonly onMedia = (frame: Buffer, linkType: number) => this.onMediaFrame(frame, linkType);
+  private readonly onCmd = (frame: Buffer, linkType: number) => this.onCommandFrame(frame, linkType);
+  private startSegment = -1;
+  private strayLogged = 0;
   private width = 0;
   private height = 0;
-  private readonly onClose = () => this.fail(new Error(`rtc live ${this.opts.stationSn}#${this.opts.channel}: session closed`));
+  private readonly onClose = () =>
+    this.fail(new Error(`rtc live ${this.opts.stationSn}#${this.opts.channel}: session closed`));
 
   constructor(private readonly opts: RtcLiveOptions) {}
 
   get mediaChannel(): number {
-    return T9000Live.MEDIA_CHANNEL_BASE + this.opts.channel;
+    // The hub streams a single-camera live on the play slot (100 + PLAY_ID), NOT on 100 + the camera's
+    // device channel — those coincide only for a camera on device_channel 1.
+    return T9000Live.MEDIA_CHANNEL_BASE + T9000Live.PLAY_ID;
   }
 
   get active(): boolean {
@@ -235,11 +269,17 @@ export class RtcLive {
     const { session, seg, accountId, logger } = this.opts;
     this.started = true;
     session.on("mediaData", this.onMedia);
+    session.on("commandData", this.onCmd);
     session.on("close", this.onClose);
     for (const pkt of buildT9000LivePrelude({ accountId, seg })) session.sendCommand(pkt);
-    const sent = session.sendCommand(buildT9000StartLive({ accountId, channel: this.opts.channel, segment: seg.next() }));
+    this.startSegment = seg.next();
+    this.strayLogged = 0;
+    const sent = session.sendCommand(
+      buildT9000StartLive({ accountId, channel: this.opts.channel, segment: this.startSegment }),
+    );
     logger?.info?.(`[rtc] ${this.opts.stationSn}#${this.opts.channel} live start sent=${sent}`);
-    if (!sent) return this.fail(new Error(`rtc live ${this.opts.stationSn}#${this.opts.channel}: command channel not open`));
+    if (!sent)
+      return this.fail(new Error(`rtc live ${this.opts.stationSn}#${this.opts.channel}: command channel not open`));
     this.keepalive = setInterval(() => {
       if (!session.sendRaw(T9000_KEEPALIVE)) logger?.warn?.(`[rtc] ${this.opts.stationSn} keepalive not sent`);
     }, this.opts.keepaliveMs ?? T9000Live.KEEPALIVE_MS);
@@ -253,6 +293,7 @@ export class RtcLive {
     if (this.keepalive) clearInterval(this.keepalive);
     this.keepalive = undefined;
     session.off("mediaData", this.onMedia);
+    session.off("commandData", this.onCmd);
     session.off("close", this.onClose);
     try {
       session.sendCommand(buildT9000StopLive({ accountId, segment: seg.next() }));
@@ -268,10 +309,34 @@ export class RtcLive {
     this.stop();
   }
 
+  /** What the hub says back while a live is up: the start's ACK (with its error code) and the encoder notifies. */
+  private onCommandFrame(frame: Buffer, linkType: number): void {
+    const p = parsePortalPacket(frame, linkType);
+    if (!p) return;
+    const tag = `[rtc] ${this.opts.stationSn}#${this.opts.channel}`;
+    if (p.isResponse && p.segment === this.startSegment) {
+      this.opts.logger?.info?.(`${tag} live start acked err=${p.errCode ?? 0}`);
+      return;
+    }
+    const inner = (p.data ?? {}) as { cmd?: number; payload?: unknown };
+    if (inner.cmd === 1366 || inner.cmd === 6246) {
+      this.opts.logger?.info?.(`${tag} hub notify ${inner.cmd} ${JSON.stringify(inner.payload ?? "").slice(0, 160)}`);
+    }
+  }
+
   private onMediaFrame(frame: Buffer, linkType: number): void {
     if (linkType !== PortalLinkType.LIVE) return;
     const h = parsePortalHeader(frame);
-    if (!h || h.commandId !== T9000Live.MEDIA || h.channel !== this.mediaChannel) return;
+    if (!h) return;
+    if (h.commandId !== T9000Live.MEDIA || h.channel !== this.mediaChannel) {
+      if (this.strayLogged < 3) {
+        this.strayLogged++;
+        this.opts.logger?.info?.(
+          `[rtc] ${this.opts.stationSn}#${this.opts.channel} media frame on cmd ${h.commandId} channel ${h.channel} (expected ${T9000Live.MEDIA} on ${this.mediaChannel}), ${h.paramLength}B`,
+        );
+      }
+      return;
+    }
     const body = frame.subarray(PORTAL_HEADER_LENGTH, PORTAL_HEADER_LENGTH + h.paramLength);
     const prefixLen = body.indexOf(ANNEX_B_START);
     // The keyframe's 22-byte hub prefix carries the picture size (u16 LE at 10 and 12); P-frames carry 2 bytes.
@@ -284,7 +349,13 @@ export class RtcLive {
       }
     }
     const data = prefixLen > 0 ? body.subarray(prefixLen) : body;
-    const out = { codec: "hevc", data, keyframe: isHevcKeyframe(data), width: this.width, height: this.height } as unknown as LiveVideoFrame;
+    const out = {
+      codec: "hevc",
+      data,
+      keyframe: isHevcKeyframe(data),
+      width: this.width,
+      height: this.height,
+    } as unknown as LiveVideoFrame;
     for (const c of this.consumers) c.deliver(out);
   }
 }
