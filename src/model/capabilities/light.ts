@@ -160,8 +160,13 @@ const LIGHT_SWITCH_JSON_TYPES: ReadonlySet<number> = new Set<number>([
   DeviceType.CAMERA_4G_S330,
 ]);
 
-/** DeviceTypes whose floodlight switch (1400) uses the level-1 int+string wire. */
+/**
+ * DeviceTypes whose floodlight switch (1400) uses the level-1 int+string wire. The Floodlight Cam 2 Pro
+ * (T8423) is verified live: the int+string frame switches the light and the device reports the new 1400
+ * value back.
+ */
 const LIGHT_SWITCH_INT_STRING_TYPES: ReadonlySet<number> = new Set<number>([
+  DeviceType.FLOODLIGHT_CAMERA_8423,
   DeviceType.INDOOR_OUTDOOR_CAMERA_1080P_NO_LIGHT,
   DeviceType.INDOOR_OUTDOOR_CAMERA_2K,
   DeviceType.INDOOR_OUTDOOR_CAMERA_1080P,

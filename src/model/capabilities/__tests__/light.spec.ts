@@ -83,6 +83,18 @@ describe("light capability module", () => {
       });
     });
 
+    it("on/off on the Floodlight Cam 2 Pro (T8423, deviceType 38) → int-string, the frame verified live", () => {
+      const t8423 = (channel = 0): CommandContext => ({ ...ctx(channel), deviceType: 38, model: "T8423" });
+      expect(intent("on", true, t8423(0))).toEqual({
+        kind: "set-param",
+        param: LIGHT_CMD.FLOODLIGHT_SWITCH,
+        value: 1,
+        form: "int-string",
+        channel: 0,
+      });
+      expect(intent("off", false, t8423(0))).toMatchObject({ kind: "set-param", form: "int-string", value: 0 });
+    });
+
     it("brightness/colorTemp/enabled → set-param pinned to direct-binary with the right param", () => {
       expect(intent("brightness", 50, ctx())).toEqual({
         kind: "set-param",
