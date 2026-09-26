@@ -61,8 +61,8 @@ export interface RtcCommandRouterDeps {
   ackTimeoutMs?: number;
   /**
    * How long to wait for the session to come up (default 12 s). A healthy hub answers in ~2 s; the
-   * default sits under Home Assistant's 15 s service timeout so a hub outage surfaces as this router's
-   * error rather than HA's own timeout.
+   * default sits under the ~15 s timeout a typical host applies to a service call, so a hub outage
+   * surfaces as this router's own error rather than the caller's timeout.
    */
   connectTimeoutMs?: number;
   /** Close an idle station session after this long (default 60 s). */
