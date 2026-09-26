@@ -1088,7 +1088,8 @@ export class EufyMega extends EventEmitter {
     // A camera on a T9000 has no P2P live; its video rides the station's control channel.
     const target = this.registry.list().find((d) => d.sn === sn);
     const media =
-      target && RtcCommandRouter.claimsMedia(target, (stationSn) => this.registry.list().find((d) => d.sn === stationSn))
+      target &&
+      RtcCommandRouter.claimsMedia(target, (stationSn) => this.registry.list().find((d) => d.sn === stationSn))
         ? this.rtc.mediaProviderFor(sn)
         : this.p2p.mediaProviderFor(sn);
     const cache = this.storedImages;
