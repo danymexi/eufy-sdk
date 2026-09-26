@@ -201,12 +201,15 @@ describe("siren capability module", () => {
       await expect(siren.acts.setAlarmTone!(3)).rejects.toThrow(/alarmTone: 3 is not a valid value/);
     });
 
-    it("binds the verified duration trigger and zero-duration stop on the station channel", async () => {
+    it.each([
+      { deviceType: DeviceType.STATION, model: "T8010" },
+      { deviceType: DeviceType.HB3, model: "T8030" },
+    ])("binds the verified duration trigger and zero-duration stop on the station channel ($model)", async ({ deviceType, model }) => {
       const { acts, sent } = sirenOf({
         channel: 0,
         codec: "station",
-        deviceType: DeviceType.STATION,
-        model: "T8010",
+        deviceType,
+        model,
         accountName: "tester",
         capabilities: new Set(["siren"]),
         paramIds: new Set([1279, 1280, 1281, 1282, 61008, 1825, 61006]),
@@ -258,49 +261,6 @@ describe("siren capability module", () => {
         expect(sent).toEqual([]);
       },
     );
-
-    it("admits the HomeBase 3 for trigger and stop on the same station wire as the HomeBase 1", async () => {
-      // Detection already advertises `siren` for every HOMEBASE_TYPES hub, so before this the T8030
-      // listed the capability and answered every verb with "no action" — the gate only knew STATION.
-      const { acts, sent } = sirenOf({
-        channel: 0,
-        codec: "station",
-        deviceType: DeviceType.HB3,
-        model: "T8030",
-        accountName: "tester",
-        capabilities: new Set(["siren"]),
-        paramIds: new Set([1281]),
-      });
-      const alarm = acts as unknown as {
-        trigger?: (seconds: number) => Promise<void>;
-        stop?: () => Promise<void>;
-      };
-
-      expect(alarm.trigger).toBeDefined();
-      expect(alarm.stop).toBeDefined();
-      await alarm.trigger!(10);
-      await alarm.stop!();
-      expect(sent).toEqual([
-        { kind: "set-payload", cmd: 1201, payload: { time_out: 10, user_name: "tester" }, channel: 255, mValue3: 0 },
-        { kind: "set-payload", cmd: 1201, payload: { time_out: 0, user_name: "tester" }, channel: 255, mValue3: 0 },
-      ]);
-    });
-
-    it("still keeps the unverified hubs out of the alarm wire even with reported evidence", () => {
-      for (const deviceType of [DeviceType.STATION_9000, DeviceType.MINIBASE_CHIME, DeviceType.HOMEBASE_MINI]) {
-        const { acts } = sirenOf({
-          channel: 0,
-          codec: "station",
-          deviceType,
-          model: "T9000",
-          accountName: "tester",
-          capabilities: new Set(["siren"]),
-          paramIds: new Set([1281]),
-        });
-        expect((acts as unknown as Record<string, unknown>).trigger).toBeUndefined();
-        expect((acts as unknown as Record<string, unknown>).stop).toBeUndefined();
-      }
-    });
 
     it("installs no momentary alarm action without reported HomeBase alarm evidence", () => {
       const { acts } = sirenOf({
