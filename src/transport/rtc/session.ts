@@ -157,6 +157,11 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     return this.peer.sendCommand(portalPacket);
   }
 
+  /** Send unframed bytes on the command channel (the portal's raw keepalive); false when not open. */
+  sendRaw(bytes: Buffer): boolean {
+    return this.peer.sendRaw(bytes);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;

@@ -29,10 +29,12 @@ class FakeSession extends EventEmitter {
     if (!this.isConnected) return false;
     this.sent.push(pkt);
     if (this.behaviour === "ack" || this.behaviour === "nack") {
-      // The hub's ACK on the wire: response header + body whose first int32 LE is the error code.
+      // The hub's ACK on the wire: response header repeating the request's segment + body whose first
+      // int32 LE is the error code.
+      const segment = parsePortalHeader(pkt)!.segment;
       const body = Buffer.alloc(4);
       body.writeInt32LE(this.behaviour === "nack" ? 1 : 0, 0);
-      const ack = Buffer.concat([buildPortalHeader(PORTAL_CMD_SET_PAYLOAD, body.length, PORTAL_STATION_CHANNEL, 0, 1), body]);
+      const ack = Buffer.concat([buildPortalHeader(PORTAL_CMD_SET_PAYLOAD, body.length, PORTAL_STATION_CHANNEL, segment, 1), body]);
       queueMicrotask(() => this.emit("commandData", ack, 1));
     } else if (this.behaviour === "close") {
       queueMicrotask(() => this.close());

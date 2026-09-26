@@ -364,6 +364,8 @@ export class EufyMega extends EventEmitter {
       ackTimeoutMs: opts.rtc?.ackTimeoutMs,
       connectTimeoutMs: opts.rtc?.connectTimeoutMs,
       idleCloseMs: opts.rtc?.idleCloseMs,
+      ffmpegPath: opts.ffmpegPath,
+      ffmpegLogLevel: opts.ffmpegLogLevel,
       onError: (e) => this.reportError(e),
     });
     this.mqtt = new MqttCommandRouter({
@@ -1083,7 +1085,12 @@ export class EufyMega extends EventEmitter {
    * current. With nothing retained the refusal stands.
    */
   private mediaProviderFor(sn: string): MediaProvider {
-    const media = this.p2p.mediaProviderFor(sn);
+    // A camera on a T9000 has no P2P live; its video rides the station's control channel.
+    const target = this.registry.list().find((d) => d.sn === sn);
+    const media =
+      target && RtcCommandRouter.claimsMedia(target, (stationSn) => this.registry.list().find((d) => d.sn === stationSn))
+        ? this.rtc.mediaProviderFor(sn)
+        : this.p2p.mediaProviderFor(sn);
     const cache = this.storedImages;
     if (!cache) return media;
     const retainedStill = () => {
