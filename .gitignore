@@ -18,3 +18,12 @@ owner-rtc-probe.mjs
 ws-diag.mjs
 start-live-probe.mjs
 raw-probe.mjs
+
+# local RTC probes (token from env, never committed)
+arm-probe.mjs
+router-probe.mjs
+live-probe.mjs
+live-probe-v2.mjs
+cap-analyze.mjs
+cap-cmds.mjs
+cap-deep.mjs
