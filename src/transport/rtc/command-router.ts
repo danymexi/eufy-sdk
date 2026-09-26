@@ -26,6 +26,12 @@ import type { EufyDevice } from "../../core/types.js";
 import type { Logger } from "../../core/logger.js";
 import { RtcSession, type RtcSessionOptions } from "./session.js";
 import { buildPortalPacket, parsePortalPacket, SegmentCounter } from "./portal-packet.js";
+import { RtcLive, type RtcLiveConsumer } from "./live.js";
+import { openReadableFromConsumer } from "../p2p/readable-egress.js";
+import type { Consumer } from "../p2p/shared-live-source.js";
+import { jpegGeometry } from "../p2p/media.js";
+import { LiveSnapshotUnavailableError, type MediaProvider, type LiveStreamConsumer } from "../../core/contracts.js";
+import { spawn } from "node:child_process";
 import { PORTAL_CMD_SET_PAYLOAD, PORTAL_STATION_CHANNEL } from "./commands.js";
 
 export interface RtcIdentity {
@@ -62,6 +68,9 @@ export interface RtcCommandRouterDeps {
   /** Close an idle station session after this long (default 60 s). */
   idleCloseMs?: number;
   onError?: (e: Error) => void;
+  /** ffmpeg for the live still (default `ffmpeg` on PATH). */
+  ffmpegPath?: string;
+  ffmpegLogLevel?: string;
   /** Session factory (tests inject a fake). */
   createSession?: (opts: RtcSessionOptions) => RtcSession;
 }
@@ -73,16 +82,26 @@ interface StationSession {
   /** Serialises sends so ACKs can't be attributed to the wrong command. */
   queue: Promise<unknown>;
   idle?: ReturnType<typeof setTimeout>;
+  /** Holders (a live view) that keep the session from idle-closing. */
+  leases: number;
 }
 
 export class RtcCommandRouter {
   private readonly sessions = new Map<string, StationSession>();
+  private readonly lives = new Map<string, RtcLive>();
 
   constructor(private readonly deps: RtcCommandRouterDeps) {}
 
   /** A T9000 station itself. Attached cameras keep their own (P2P) path for now. */
   static claimsDevice(dev: EufyDevice): boolean {
     return /^T9000/i.test(dev.model ?? "") && (!dev.stationSn || dev.stationSn === dev.sn);
+  }
+
+  /** A camera attached to a T9000 station: its live view rides the station's control channel. */
+  static claimsMedia(dev: EufyDevice, stationOf: (sn: string) => EufyDevice | undefined): boolean {
+    if (!dev.stationSn || dev.stationSn === dev.sn) return false;
+    const station = stationOf(dev.stationSn);
+    return !!station && RtcCommandRouter.claimsDevice(station);
   }
 
   async dispatchCommand(sn: string, cmd: Command): Promise<void> {
@@ -98,19 +117,21 @@ export class RtcCommandRouter {
     const st = await this.stationSession(sn, adminUserId, identity);
     // A station-scoped command rides the broadcast channel; a device-scoped one keeps its own.
     const channel = !dev?.stationSn || dev.stationSn === sn ? PORTAL_STATION_CHANNEL : cmd.channel;
+    const segment = st.seg.next();
     const packet = buildPortalPacket({
       commandId: PORTAL_CMD_SET_PAYLOAD,
       channel,
-      segment: st.seg.next(),
+      segment,
       payload: { account_id: adminUserId, cmd: cmd.cmd, mValue3: cmd.mValue3 ?? 0, payload: cmd.payload },
     });
-    const run = st.queue.then(() => this.sendAwaitAck(sn, st, packet, cmd.cmd));
+    const run = st.queue.then(() => this.sendAwaitAck(sn, st, packet, cmd.cmd, segment));
     st.queue = run.catch(() => undefined);
     return run;
   }
 
   /** Tear down every station session (logout / shutdown). */
   close(): void {
+    this.lives.clear();
     for (const [sn, st] of this.sessions) {
       if (st.idle) clearTimeout(st.idle);
       try {
@@ -122,12 +143,13 @@ export class RtcCommandRouter {
     }
   }
 
-  private sendAwaitAck(sn: string, st: StationSession, packet: Buffer, innerCmd: number): Promise<void> {
+  private sendAwaitAck(sn: string, st: StationSession, packet: Buffer, innerCmd: number, segment: number): Promise<void> {
     const timeoutMs = this.deps.ackTimeoutMs ?? 8_000;
     return new Promise<void>((resolve, reject) => {
       const onData = (frame: Buffer, linkType: number) => {
         const p = parsePortalPacket(frame, linkType);
-        if (!p || p.commandId !== PORTAL_CMD_SET_PAYLOAD || !p.isResponse) return;
+        // The hub's ACK repeats the request's segment — correlate on it, since a live view shares this session.
+        if (!p || p.commandId !== PORTAL_CMD_SET_PAYLOAD || !p.isResponse || p.segment !== segment) return;
         cleanup();
         if (p.errCode && p.errCode !== 0) {
           reject(new Error(`rtc: ${sn} rejected cmd ${innerCmd} (err ${p.errCode})`));
@@ -199,7 +221,7 @@ export class RtcCommandRouter {
       await connected;
       this.deps.logger?.info?.(`[rtc] ${sn} command channel up (${this.deps.icePolicy ?? "relay"})`);
     })();
-    const st: StationSession = { session, seg: new SegmentCounter(), ready, queue: Promise.resolve() };
+    const st: StationSession = { session, seg: new SegmentCounter(), ready, queue: Promise.resolve(), leases: 0 };
     session.on("error", (e) => this.deps.onError?.(e));
     session.on("close", () => {
       if (this.sessions.get(sn) === st) this.sessions.delete(sn);
@@ -217,9 +239,105 @@ export class RtcCommandRouter {
 
   private touch(sn: string, st: StationSession): void {
     if (st.idle) clearTimeout(st.idle);
+    if (st.leases > 0) return; // a live view holds the session open
     const idleMs = this.deps.idleCloseMs ?? 60_000;
     st.idle = setTimeout(() => this.drop(sn, st), idleMs);
     st.idle.unref?.();
+  }
+
+  /**
+   * The station's session for media that must ride the SAME session as the commands (one RTC session per
+   * account), with a lease that keeps it from idle-closing until released.
+   */
+  async sessionFor(stationSn: string): Promise<{ session: RtcSession; seg: SegmentCounter; accountId: string; release: () => void }> {
+    const dev = this.deps.findDevice(stationSn);
+    const identity = this.deps.identity();
+    if (!identity) throw new Error(`rtc: not logged in, cannot open ${stationSn}`);
+    const member = ((dev?.raw ?? {}) as { member?: { admin_user_id?: unknown } }).member;
+    const accountId = (typeof member?.admin_user_id === "string" && member.admin_user_id) || identity.userId;
+    const st = await this.stationSession(stationSn, accountId, identity);
+    st.leases++;
+    if (st.idle) clearTimeout(st.idle);
+    let released = false;
+    return {
+      session: st.session,
+      seg: st.seg,
+      accountId,
+      release: () => {
+        if (released) return;
+        released = true;
+        st.leases = Math.max(0, st.leases - 1);
+        this.touch(stationSn, st);
+      },
+    };
+  }
+
+  /** The live view of a camera on a T9000, one per (station, channel), started/stopped with its consumers. */
+  private async liveFor(sn: string): Promise<RtcLive> {
+    const dev = this.deps.findDevice(sn);
+    if (!dev?.stationSn) throw new Error(`rtc live: ${sn} is not attached to a station`);
+    const raw = (dev.raw ?? {}) as { device_channel?: unknown };
+    const channel = typeof raw.device_channel === "number" ? raw.device_channel : Number(raw.device_channel);
+    if (!Number.isInteger(channel)) throw new Error(`rtc live: ${sn} has no device_channel`);
+    const existing = this.lives.get(sn);
+    if (existing?.active) return existing;
+    const lease = await this.sessionFor(dev.stationSn);
+    const live = new RtcLive({
+      session: lease.session,
+      seg: lease.seg,
+      stationSn: dev.stationSn,
+      channel,
+      accountId: lease.accountId,
+      logger: this.deps.logger,
+      onIdle: () => {
+        if (this.lives.get(sn) === live) this.lives.delete(sn);
+        lease.release();
+      },
+    });
+    this.lives.set(sn, live);
+    return live;
+  }
+
+  /**
+   * A {@link MediaProvider} for a camera on a T9000: live video over the station's control channel
+   * (HEVC Annex B). Recording, talkback and P2P queries have no wire here yet and are refused.
+   */
+  mediaProviderFor(sn: string): MediaProvider {
+    const unsupported = (what: string) => new Error(`${what} is not available for a T9000 camera over the control channel`);
+    const attach = async (): Promise<RtcLiveConsumer> => (await this.liveFor(sn)).attach();
+    const openReadable: NonNullable<MediaProvider["openReadable"]> = async (opts) => {
+      const consumer = await attach();
+      const readable = openReadableFromConsumer(consumer as unknown as Consumer, opts);
+      opts?.signal?.addEventListener("abort", () => readable.destroy(), { once: true });
+      return readable;
+    };
+    return {
+      live: async (): Promise<LiveStreamConsumer> => attach(),
+      openReadable,
+      snapshotLive: async (opts) => {
+        const timeoutMs = opts?.timeoutMs ?? 15_000;
+        const readable = await openReadable();
+        const args = ["-hide_banner", "-loglevel", this.deps.ffmpegLogLevel ?? "error", "-f", "hevc", "-i", "pipe:0", "-frames:v", "1", "-f", "image2", "pipe:1"];
+        const ff = spawn(this.deps.ffmpegPath ?? "ffmpeg", args, { stdio: ["pipe", "pipe", "ignore"] });
+        const chunks: Buffer[] = [];
+        const jpeg = await new Promise<Buffer>((resolve, reject) => {
+          const timer = setTimeout(() => { ff.kill("SIGKILL"); reject(new LiveSnapshotUnavailableError("no-keyframe", `no keyframe decoded within ${timeoutMs}ms`)); }, timeoutMs);
+          ff.stdout.on("data", (c: Buffer) => chunks.push(c));
+          ff.on("error", (e) => { clearTimeout(timer); reject(e); });
+          ff.on("close", () => { clearTimeout(timer); const out = Buffer.concat(chunks); out.length ? resolve(out) : reject(new LiveSnapshotUnavailableError("undecodable-burst", "ffmpeg produced no image")); });
+          readable.on("error", () => ff.stdin.end());
+          readable.pipe(ff.stdin);
+        }).finally(() => readable.destroy());
+        const geometry = jpegGeometry(jpeg);
+        if (!geometry) throw new LiveSnapshotUnavailableError("undecodable-burst", "decoded image has no JPEG geometry");
+        return { jpeg, ...geometry };
+      },
+      record: async () => { throw unsupported("record"); },
+      recordFragments: () => { throw unsupported("recordFragments"); },
+      talkback: async () => { throw unsupported("talkback"); },
+      p2pQuery: async () => { throw unsupported("p2pQuery"); },
+      p2pControlQuery: async () => { throw unsupported("p2pControlQuery"); },
+    } as MediaProvider;
   }
 
   private drop(sn: string, st: StationSession): void {

@@ -178,6 +178,7 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
   private pc?: NativePeerConnection;
   private readonly channels = new Map<string, NativeDataChannel>();
   private framer?: PortalFramer;
+  private readonly wireTally = new Map<string, number>();
   private framerInit?: Promise<void>;
   private commandOpen = false;
   private remoteSet = false;
@@ -311,6 +312,17 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
    * Send one portal packet on the command channel, through the framer. False when the channel is not
    * usable OR the native send refused a wire packet — a dropped frame must not read as success.
    */
+  /**
+   * Send bytes on the command channel AS THEY ARE — no PTCS framing. The portal's data-channel keepalive
+   * (a 20-byte prefix + a bare `XZYH 1139`, every ~29 s, echoed by the hub) rides the wire unframed, and the
+   * framer would wrap it. False when the channel isn't open.
+   */
+  sendRaw(bytes: Buffer): boolean {
+    const dc = this.channels.get(COMMAND_CHANNEL);
+    if (!dc?.isOpen()) return false;
+    return dc.sendMessageBinary(bytes);
+  }
+
   sendCommand(portalPacket: Buffer): boolean {
     const dc = this.channels.get(COMMAND_CHANNEL);
     if (!dc?.isOpen() || !this.commandOpen || !this.framer?.isReady()) return false;
@@ -390,6 +402,12 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     dc.onError((err) => this.emit("error", new Error(`RTC data channel ${label}: ${err}`)));
     dc.onMessage((msg) => {
       const buf = typeof msg === "string" ? Buffer.from(msg) : Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+      // Per-channel wire tally (debug): the first packets of each label, then one line per 100.
+      const n = (this.wireTally.get(label) ?? 0) + 1;
+      this.wireTally.set(label, n);
+      if (n <= 3 || n % 100 === 0) {
+        this.logger.debug(`[rtc] wire ${label} #${n} ${buf.length}B ${buf.subarray(0, 8).toString("hex")}`);
+      }
       if (this.framer?.isReady()) {
         this.framer.recvPacket(buf);
         return;
