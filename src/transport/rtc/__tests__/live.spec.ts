@@ -115,15 +115,12 @@ describe("RtcLive", () => {
       keepaliveMs: 1000,
     });
     const frames: number[] = [];
-    l5.attach().onMedia(({ frame }) => frames.push(frame.data.length));
+    const c = l5.attach();
+    c.onMedia(({ frame }) => frames.push(frame.data.length));
     s.emit("mediaData", media(105, Buffer.concat([vps, idr]), true), PortalLinkType.LIVE); // device channel: NOT where video comes
     s.emit("mediaData", media(101, Buffer.concat([vps, idr]), true), PortalLinkType.LIVE); // play slot: this is the stream
     expect(frames.length).toBe(1);
-    l5.release(
-      l5["consumers"]
-        ? [...(l5 as unknown as { consumers: Set<{ detach(): void }> }).consumers][0]
-        : (undefined as never),
-    );
+    c.detach();
   });
 
   it("starts on the first consumer with the portal's prelude then the start, and stops with 1004 after the last one", () => {
