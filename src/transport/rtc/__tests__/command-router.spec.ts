@@ -13,6 +13,8 @@ class FakeSession extends EventEmitter {
   sent: Buffer[] = [];
   /** What to do with a sent packet: "ack" (default), "nack" (errCode 1), "silent", or "close". */
   behaviour: "ack" | "nack" | "silent" | "close" = "ack";
+  /** How connect() behaves: come up (default), throw, or never answer. */
+  static connectMode: "up" | "throw" | "never" = "up";
   constructor(readonly opts: RtcSessionOptions) {
     super();
   }
@@ -20,10 +22,21 @@ class FakeSession extends EventEmitter {
     return this.connected && !this.closed;
   }
   async connect(): Promise<void> {
+    if (FakeSession.connectMode === "throw") throw new Error("sign refused");
+    if (FakeSession.connectMode === "never") return;
     queueMicrotask(() => {
       this.connected = true;
       this.emit("connected");
     });
+  }
+  /** Inject an ACK for an arbitrary segment, as a hub answering late would. */
+  ackSegment(segment: number): void {
+    const body = Buffer.alloc(4);
+    this.emit(
+      "commandData",
+      Buffer.concat([buildPortalHeader(PORTAL_CMD_SET_PAYLOAD, body.length, PORTAL_STATION_CHANNEL, segment, 1), body]),
+      1,
+    );
   }
   sendCommand(pkt: Buffer): boolean {
     if (!this.isConnected) return false;
@@ -34,7 +47,10 @@ class FakeSession extends EventEmitter {
       const segment = parsePortalHeader(pkt)!.segment;
       const body = Buffer.alloc(4);
       body.writeInt32LE(this.behaviour === "nack" ? 1 : 0, 0);
-      const ack = Buffer.concat([buildPortalHeader(PORTAL_CMD_SET_PAYLOAD, body.length, PORTAL_STATION_CHANNEL, segment, 1), body]);
+      const ack = Buffer.concat([
+        buildPortalHeader(PORTAL_CMD_SET_PAYLOAD, body.length, PORTAL_STATION_CHANNEL, segment, 1),
+        body,
+      ]);
       queueMicrotask(() => this.emit("commandData", ack, 1));
     } else if (this.behaviour === "close") {
       queueMicrotask(() => this.close());
@@ -50,7 +66,12 @@ class FakeSession extends EventEmitter {
 }
 
 const SN = "T9000P0000000001";
-const station = { sn: SN, model: "T9000", stationSn: SN, raw: { member: { admin_user_id: "adminid" } } } as unknown as EufyDevice;
+const station = {
+  sn: SN,
+  model: "T9000",
+  stationSn: SN,
+  raw: { member: { admin_user_id: "adminid" } },
+} as unknown as EufyDevice;
 
 function makeRouter(over: Partial<RtcCommandRouterDeps> = {}) {
   const sessions: FakeSession[] = [];
@@ -73,20 +94,35 @@ function makeRouter(over: Partial<RtcCommandRouterDeps> = {}) {
 }
 
 /** Decode a request the router sent: header fields + the JSON body (a request body is plain JSON). */
-const sent = (buf: Buffer) => ({ ...parsePortalHeader(buf)!, body: JSON.parse(buf.subarray(PORTAL_HEADER_LENGTH).toString("utf8")) as Record<string, unknown> });
+const sent = (buf: Buffer) => ({
+  ...parsePortalHeader(buf)!,
+  body: JSON.parse(buf.subarray(PORTAL_HEADER_LENGTH).toString("utf8")) as Record<string, unknown>,
+});
 
-const arming = (mode: number) => ({ kind: "set-payload" as const, cmd: 1224, payload: { mode_type: mode, user_name: "Home Assistant" }, channel: 0, mValue3: 0 });
+const arming = (mode: number) => ({
+  kind: "set-payload" as const,
+  cmd: 1224,
+  payload: { mode_type: mode, user_name: "Home Assistant" },
+  channel: 0,
+  mValue3: 0,
+});
 
 describe("RtcCommandRouter", () => {
   it("claims a T9000 station itself, not other hubs nor cameras attached to it", () => {
     expect(RtcCommandRouter.claimsDevice(station)).toBe(true);
-    expect(RtcCommandRouter.claimsDevice({ sn: "T8030X", model: "T8030", stationSn: "T8030X" } as unknown as EufyDevice)).toBe(false);
-    expect(RtcCommandRouter.claimsDevice({ sn: "T8410C", model: "T8410", stationSn: SN } as unknown as EufyDevice)).toBe(false);
+    expect(
+      RtcCommandRouter.claimsDevice({ sn: "T8030X", model: "T8030", stationSn: "T8030X" } as unknown as EufyDevice),
+    ).toBe(false);
+    expect(
+      RtcCommandRouter.claimsDevice({ sn: "T8410C", model: "T8410", stationSn: SN } as unknown as EufyDevice),
+    ).toBe(false);
   });
 
   it("refuses command kinds it cannot carry instead of misrouting them", async () => {
     const { router, sessions } = makeRouter();
-    await expect(router.dispatchCommand(SN, { kind: "set-param", param: 1, value: 1, form: "auto", channel: 0 } as never)).rejects.toThrow(/only set-payload/);
+    await expect(
+      router.dispatchCommand(SN, { kind: "set-param", param: 1, value: 1, form: "auto", channel: 0 } as never),
+    ).rejects.toThrow(/only set-payload/);
     expect(sessions).toHaveLength(0);
   });
 
@@ -105,7 +141,12 @@ describe("RtcCommandRouter", () => {
     expect(p.commandId).toBe(PORTAL_CMD_SET_PAYLOAD);
     expect(p.channel).toBe(PORTAL_STATION_CHANNEL);
     expect(p.isResponse).toBe(0);
-    expect(p.body).toEqual({ account_id: "adminid", cmd: 1224, mValue3: 0, payload: { mode_type: 1, user_name: "Home Assistant" } });
+    expect(p.body).toEqual({
+      account_id: "adminid",
+      cmd: 1224,
+      mValue3: 0,
+      payload: { mode_type: 1, user_name: "Home Assistant" },
+    });
   });
 
   it("reuses the station session across commands and serialises them", async () => {
@@ -135,6 +176,40 @@ describe("RtcCommandRouter", () => {
     await r2.dispatchCommand(SN, arming(1));
     s2[0]!.behaviour = "close";
     await expect(r2.dispatchCommand(SN, arming(2))).rejects.toThrow(/session closed/);
+  });
+
+  it("does not let a late ACK for a timed-out command complete the next one", async () => {
+    const { router, sessions } = makeRouter();
+    await router.dispatchCommand(SN, arming(1));
+    const s = sessions[0]!;
+    s.behaviour = "silent";
+    await expect(router.dispatchCommand(SN, arming(2))).rejects.toThrow(/ACK timed out/);
+    const timedOut = sent(s.sent[1]!).segment;
+    // B is in flight on the same session when A's ACK finally arrives: B must NOT resolve on it.
+    const b = router.dispatchCommand(SN, arming(3));
+    await new Promise((r) => setTimeout(r, 5));
+    s.ackSegment(timedOut);
+    await expect(b).rejects.toThrow(/ACK timed out/);
+    expect(s.sent).toHaveLength(3); // nothing was replayed
+  });
+
+  it("fails the bring-up once, with the session closed, when connect() throws or never comes up", async () => {
+    FakeSession.connectMode = "throw";
+    try {
+      const { router, sessions } = makeRouter();
+      await expect(router.dispatchCommand(SN, arming(1))).rejects.toThrow(/sign refused/);
+      expect(sessions[0]!.closed).toBe(true);
+      FakeSession.connectMode = "never";
+      const { router: r2, sessions: s2 } = makeRouter({ connectTimeoutMs: 30 });
+      await expect(r2.dispatchCommand(SN, arming(1))).rejects.toThrow(/did not come up within 30ms/);
+      expect(s2[0]!.closed).toBe(true);
+      // the deadline has passed and the session is gone: a retry opens a fresh one instead of reusing it
+      FakeSession.connectMode = "up";
+      await r2.dispatchCommand(SN, arming(1));
+      expect(s2).toHaveLength(2);
+    } finally {
+      FakeSession.connectMode = "up";
+    }
   });
 
   it("opens a fresh session after the previous one closed", async () => {

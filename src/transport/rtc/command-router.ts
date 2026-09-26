@@ -143,7 +143,13 @@ export class RtcCommandRouter {
     }
   }
 
-  private sendAwaitAck(sn: string, st: StationSession, packet: Buffer, innerCmd: number, segment: number): Promise<void> {
+  private sendAwaitAck(
+    sn: string,
+    st: StationSession,
+    packet: Buffer,
+    innerCmd: number,
+    segment: number,
+  ): Promise<void> {
     const timeoutMs = this.deps.ackTimeoutMs ?? 8_000;
     return new Promise<void>((resolve, reject) => {
       const onData = (frame: Buffer, linkType: number) => {
@@ -205,22 +211,7 @@ export class RtcCommandRouter {
       peer: { logger: this.deps.logger, icePolicy: this.deps.icePolicy ?? "relay" },
     });
     const connectTimeoutMs = this.deps.connectTimeoutMs ?? 12_000;
-    const ready = (async () => {
-      const connected = new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error(`rtc: ${sn} did not come up within ${connectTimeoutMs}ms`)), connectTimeoutMs);
-        session.once("connected", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-        session.once("close", () => {
-          clearTimeout(timer);
-          reject(new Error(`rtc: ${sn} session closed before the command channel opened`));
-        });
-      });
-      await session.connect();
-      await connected;
-      this.deps.logger?.info?.(`[rtc] ${sn} command channel up (${this.deps.icePolicy ?? "relay"})`);
-    })();
+    const ready = this.bringUp(sn, session, connectTimeoutMs);
     const st: StationSession = { session, seg: new SegmentCounter(), ready, queue: Promise.resolve(), leases: 0 };
     session.on("error", (e) => this.deps.onError?.(e));
     session.on("close", () => {
@@ -237,6 +228,46 @@ export class RtcCommandRouter {
     return st;
   }
 
+  /**
+   * One bounded bring-up: the session is up when its command channel opens, and it fails — with the
+   * session closed and every listener gone — when `connect()` throws, the session closes first, or the
+   * deadline passes. A single promise, so an early failure cannot leave a second one rejecting unheard.
+   */
+  private bringUp(sn: string, session: RtcSession, connectTimeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        session.off("connected", onConnected);
+        session.off("close", onClose);
+        if (err) {
+          try {
+            session.close();
+          } catch {
+            /* already gone */
+          }
+          reject(err);
+        } else {
+          this.deps.logger?.info?.(`[rtc] ${sn} command channel up (${this.deps.icePolicy ?? "relay"})`);
+          resolve();
+        }
+      };
+      const onConnected = () => finish();
+      const onClose = () => finish(new Error(`rtc: ${sn} session closed before the command channel opened`));
+      const timer = setTimeout(
+        () => finish(new Error(`rtc: ${sn} did not come up within ${connectTimeoutMs}ms`)),
+        connectTimeoutMs,
+      );
+      session.once("connected", onConnected);
+      session.once("close", onClose);
+      Promise.resolve()
+        .then(() => session.connect())
+        .catch((e: unknown) => finish(e instanceof Error ? e : new Error(String(e))));
+    });
+  }
+
   private touch(sn: string, st: StationSession): void {
     if (st.idle) clearTimeout(st.idle);
     if (st.leases > 0) return; // a live view holds the session open
@@ -249,7 +280,9 @@ export class RtcCommandRouter {
    * The station's session for media that must ride the SAME session as the commands (one RTC session per
    * account), with a lease that keeps it from idle-closing until released.
    */
-  async sessionFor(stationSn: string): Promise<{ session: RtcSession; seg: SegmentCounter; accountId: string; release: () => void }> {
+  async sessionFor(
+    stationSn: string,
+  ): Promise<{ session: RtcSession; seg: SegmentCounter; accountId: string; release: () => void }> {
     const dev = this.deps.findDevice(stationSn);
     const identity = this.deps.identity();
     if (!identity) throw new Error(`rtc: not logged in, cannot open ${stationSn}`);
@@ -303,7 +336,8 @@ export class RtcCommandRouter {
    * (HEVC Annex B). Recording, talkback and P2P queries have no wire here yet and are refused.
    */
   mediaProviderFor(sn: string): MediaProvider {
-    const unsupported = (what: string) => new Error(`${what} is not available for a T9000 camera over the control channel`);
+    const unsupported = (what: string) =>
+      new Error(`${what} is not available for a T9000 camera over the control channel`);
     const attach = async (): Promise<RtcLiveConsumer> => (await this.liveFor(sn)).attach();
     const openReadable: NonNullable<MediaProvider["openReadable"]> = async (opts) => {
       const consumer = await attach();
@@ -317,26 +351,62 @@ export class RtcCommandRouter {
       snapshotLive: async (opts) => {
         const timeoutMs = opts?.timeoutMs ?? 15_000;
         const readable = await openReadable();
-        const args = ["-hide_banner", "-loglevel", this.deps.ffmpegLogLevel ?? "error", "-f", "hevc", "-i", "pipe:0", "-frames:v", "1", "-f", "image2", "pipe:1"];
+        const args = [
+          "-hide_banner",
+          "-loglevel",
+          this.deps.ffmpegLogLevel ?? "error",
+          "-f",
+          "hevc",
+          "-i",
+          "pipe:0",
+          "-frames:v",
+          "1",
+          "-f",
+          "image2",
+          "pipe:1",
+        ];
         const ff = spawn(this.deps.ffmpegPath ?? "ffmpeg", args, { stdio: ["pipe", "pipe", "ignore"] });
         const chunks: Buffer[] = [];
         const jpeg = await new Promise<Buffer>((resolve, reject) => {
-          const timer = setTimeout(() => { ff.kill("SIGKILL"); reject(new LiveSnapshotUnavailableError("no-keyframe", `no keyframe decoded within ${timeoutMs}ms`)); }, timeoutMs);
+          const timer = setTimeout(() => {
+            ff.kill("SIGKILL");
+            reject(new LiveSnapshotUnavailableError("no-keyframe", `no keyframe decoded within ${timeoutMs}ms`));
+          }, timeoutMs);
           ff.stdout.on("data", (c: Buffer) => chunks.push(c));
-          ff.on("error", (e) => { clearTimeout(timer); reject(e); });
-          ff.on("close", () => { clearTimeout(timer); const out = Buffer.concat(chunks); out.length ? resolve(out) : reject(new LiveSnapshotUnavailableError("undecodable-burst", "ffmpeg produced no image")); });
+          ff.on("error", (e) => {
+            clearTimeout(timer);
+            reject(e);
+          });
+          ff.on("close", () => {
+            clearTimeout(timer);
+            const out = Buffer.concat(chunks);
+            out.length
+              ? resolve(out)
+              : reject(new LiveSnapshotUnavailableError("undecodable-burst", "ffmpeg produced no image"));
+          });
           readable.on("error", () => ff.stdin.end());
           readable.pipe(ff.stdin);
         }).finally(() => readable.destroy());
         const geometry = jpegGeometry(jpeg);
-        if (!geometry) throw new LiveSnapshotUnavailableError("undecodable-burst", "decoded image has no JPEG geometry");
+        if (!geometry)
+          throw new LiveSnapshotUnavailableError("undecodable-burst", "decoded image has no JPEG geometry");
         return { jpeg, ...geometry };
       },
-      record: async () => { throw unsupported("record"); },
-      recordFragments: () => { throw unsupported("recordFragments"); },
-      talkback: async () => { throw unsupported("talkback"); },
-      p2pQuery: async () => { throw unsupported("p2pQuery"); },
-      p2pControlQuery: async () => { throw unsupported("p2pControlQuery"); },
+      record: async () => {
+        throw unsupported("record");
+      },
+      recordFragments: () => {
+        throw unsupported("recordFragments");
+      },
+      talkback: async () => {
+        throw unsupported("talkback");
+      },
+      p2pQuery: async () => {
+        throw unsupported("p2pQuery");
+      },
+      p2pControlQuery: async () => {
+        throw unsupported("p2pControlQuery");
+      },
     } as MediaProvider;
   }
 
