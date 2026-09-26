@@ -104,6 +104,28 @@ describe("RtcLive", () => {
   });
   afterEach(() => vi.useRealTimers());
 
+  it("filters media on the play slot (101), not the device channel: a camera on channel 5 still streams", () => {
+    const l5 = new RtcLive({
+      session: s as unknown as RtcSession,
+      seg,
+      stationSn: "T9000X",
+      channel: 5,
+      accountId: "acct",
+      onIdle: idle,
+      keepaliveMs: 1000,
+    });
+    const frames: number[] = [];
+    l5.attach().onMedia(({ frame }) => frames.push(frame.data.length));
+    s.emit("mediaData", media(105, Buffer.concat([vps, idr]), true), PortalLinkType.LIVE); // device channel: NOT where video comes
+    s.emit("mediaData", media(101, Buffer.concat([vps, idr]), true), PortalLinkType.LIVE); // play slot: this is the stream
+    expect(frames.length).toBe(1);
+    l5.release(
+      l5["consumers"]
+        ? [...(l5 as unknown as { consumers: Set<{ detach(): void }> }).consumers][0]
+        : (undefined as never),
+    );
+  });
+
   it("starts on the first consumer with the portal's prelude then the start, and stops with 1004 after the last one", () => {
     const c = live.attach();
     expect(live.active).toBe(true);
