@@ -170,7 +170,19 @@ function turnServers(turn: TurnConfig): NativeIceServer[] {
 }
 
 async function loadNativePeerFactory(): Promise<NativePeerFactory> {
-  const ndc = await import("node-datachannel");
+  // `node-datachannel` is an OPTIONAL dependency: only a T9000 (S1 Pro) station needs the WebRTC
+  // transport, so a consumer without one never installs the native addon. Loaded on demand here, with
+  // a clear message if it is missing rather than a bare module-not-found.
+  let ndc: typeof import("node-datachannel");
+  try {
+    ndc = await import("node-datachannel");
+  } catch (err) {
+    throw new Error(
+      "the WebRTC transport for a HomeBase S1 Pro (T9000) needs the optional 'node-datachannel' package — " +
+        "install it to drive a T9000 over RTC (`npm install node-datachannel`)",
+      { cause: err },
+    );
+  }
   return (name, config) => new ndc.PeerConnection(name, config as never) as unknown as NativePeerConnection;
 }
 
