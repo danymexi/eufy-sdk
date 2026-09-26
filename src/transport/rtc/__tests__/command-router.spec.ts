@@ -14,7 +14,7 @@ class FakeSession extends EventEmitter {
   /** What to do with a sent packet: "ack" (default), "nack" (errCode 1), "silent", or "close". */
   behaviour: "ack" | "nack" | "silent" | "close" = "ack";
   /** How connect() behaves: come up (default), throw, or never answer. */
-  static connectMode: "up" | "throw" | "never" = "up";
+  static connectMode: "up" | "throw" | "never" | "hang" = "up";
   constructor(readonly opts: RtcSessionOptions) {
     super();
   }
@@ -23,7 +23,10 @@ class FakeSession extends EventEmitter {
   }
   async connect(): Promise<void> {
     if (FakeSession.connectMode === "throw") throw new Error("sign refused");
+    // "never": connect() resolves but the session never emits `connected`.
+    // "hang": connect() itself never settles — the deadline must still fire.
     if (FakeSession.connectMode === "never") return;
+    if (FakeSession.connectMode === "hang") return new Promise<void>(() => {});
     queueMicrotask(() => {
       this.connected = true;
       this.emit("connected");
@@ -203,6 +206,11 @@ describe("RtcCommandRouter", () => {
       const { router: r2, sessions: s2 } = makeRouter({ connectTimeoutMs: 30 });
       await expect(r2.dispatchCommand(SN, arming(1))).rejects.toThrow(/did not come up within 30ms/);
       expect(s2[0]!.closed).toBe(true);
+      // connect() that never settles at all: the bounded bring-up's deadline still fires and closes it
+      FakeSession.connectMode = "hang";
+      const { router: r3, sessions: s3 } = makeRouter({ connectTimeoutMs: 30 });
+      await expect(r3.dispatchCommand(SN, arming(1))).rejects.toThrow(/did not come up within 30ms/);
+      expect(s3[0]!.closed).toBe(true);
       // the deadline has passed and the session is gone: a retry opens a fresh one instead of reusing it
       FakeSession.connectMode = "up";
       await r2.dispatchCommand(SN, arming(1));
