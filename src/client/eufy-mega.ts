@@ -722,7 +722,7 @@ export class EufyMega extends EventEmitter {
       if (epoch !== this.realtimeEpoch) return false;
       const initialDevice = this.liveDevices.get(sn)?.deref();
       const before = initialDevice?.getProperty(refresh.property)?.value;
-      const rawBefore = this.registry.require(sn).params?.[refresh.param];
+      const rawBefore = this.registry.knownParam(sn, refresh.param);
       const deadline = Date.now() + refresh.timeoutMs;
       /**
        * Whether the state already on hand satisfies the observation, applying it to the live device when it
@@ -731,8 +731,7 @@ export class EufyMega extends EventEmitter {
        */
       const settled = (): boolean => {
         const device = this.liveDevices.get(sn)?.deref();
-        const record = this.registry.require(sn);
-        const rawValue = record.params?.[refresh.param];
+        const rawValue = this.registry.knownParam(sn, refresh.param);
         const converged =
           refresh.expected === undefined
             ? device
@@ -741,7 +740,7 @@ export class EufyMega extends EventEmitter {
             : String(rawValue) === String(refresh.expected);
         if (!converged) return false;
         if (!device) return true;
-        device.applyParams(record.params ?? {});
+        if (rawValue !== undefined) device.applyParams({ [refresh.param]: rawValue });
         return this.matchesObservation(device.getProperty(refresh.property)?.value, refresh, before);
       };
       if (refresh.expected !== undefined && settled()) return true;
@@ -764,7 +763,7 @@ export class EufyMega extends EventEmitter {
         property: refresh.property,
         param: refresh.param,
         expected: refresh.expected,
-        observed: this.registry.require(sn).params?.[refresh.param],
+        observed: this.registry.knownParam(sn, refresh.param),
         timeoutMs: refresh.timeoutMs,
       });
     })();

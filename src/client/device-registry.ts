@@ -394,6 +394,12 @@ export class DeviceRegistry {
     return this.devices.filter((d) => d.realtime === "p2p");
   }
 
+  /** Read a cached parameter with realtime state taking precedence over the cloud list. Fetches nothing. */
+  knownParam(sn: string, param: number): string | undefined {
+    const device = this.require(sn);
+    return this.dpParams.get(sn)?.[param] ?? device.params?.[param];
+  }
+
   /**
    * Resolve a serial to its cached {@link EufyDevice}, **throwing if it isn't loaded** — the loud
    * synchronous lookup the facade's command sink uses before asking a transport stack whether it claims
