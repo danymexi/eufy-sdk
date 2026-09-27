@@ -1685,10 +1685,31 @@ export class EufyMega extends EventEmitter {
    * from the base's persistent session). Reads capabilities on the client side — no model type leaks to
    * transport (the router only ever sees the `"wired"|"battery"` string).
    */
+  /** Hardwired cameras that act as their own station but report battery-family params: their P2P
+   * session must stay persistent so arming is instant. Floodlight cams (T8422–T8426) and wall-light
+   * cams (T84A1, T81A0) are mains-only. Session-tier only; not the battery capability. */
+  private static readonly MAINS_STATION_CAMERA_MODELS = [
+    "T8422",
+    "T8423",
+    "T8424",
+    "T8425",
+    "T8426",
+    "T84A1",
+    "T81A0",
+  ] as const;
+
   private stationPower(parentSn: string): PowerTier {
     const d = this.registry.list().find((x) => x.sn === parentSn);
     if (!d) return "wired";
     if (d.deviceClass === "homebase") return "wired";
+    // A hardwired camera acting as its own station (a floodlight or wall-light cam) still reports the
+    // battery-family params, so the capability check below would call it "battery" and let its session
+    // idle-close — then every arming/command pays a fresh handshake + level-2 negotiation (~10 s, which
+    // was overrunning the host's service timeout). These models are mains-only, so keep the session
+    // persistent. Session tier ONLY — the battery capability and its sentinel reads are untouched.
+    if (EufyMega.MAINS_STATION_CAMERA_MODELS.some((p) => (d.model ?? "").toUpperCase().startsWith(p))) {
+      return "wired";
+    }
     const raw = (d.raw ?? {}) as Record<string, any>;
     const caps = resolveDevice({
       deviceType: typeof raw.device_type === "number" ? (raw.device_type as number) : undefined,
