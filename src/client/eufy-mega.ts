@@ -803,7 +803,7 @@ export class EufyMega extends EventEmitter {
    */
   private recycleStandaloneSession(sn: string): Promise<void> {
     const releaseWrite = new Promise<void>((resolve) => void setTimeout(resolve, SESSION_RECYCLE_WAIT_MS).unref?.());
-    return Promise.race([
+    const recycled = Promise.race([
       this.p2p.resetStandaloneSession(sn),
       releaseWrite.then(() =>
         this.opts.logger?.debug(
@@ -811,6 +811,16 @@ export class EufyMega extends EventEmitter {
         ),
       ),
     ]);
+    // The recycle resets the level-2 counter by closing the session, which otherwise leaves it COLD:
+    // the next mode write then pays a full handshake (~10 s, and it was overrunning host timeouts). For
+    // a MAINS station (a floodlight/wall-light cam that is its own station) reopen it in the background
+    // once the reset lands, so the next write finds it warm AND on a fresh counter — fast and reliable.
+    // A battery station is left to sleep (no reopen), preserving its power behaviour.
+    const station = this.p2p.stationKeyOf(sn);
+    if (station === sn && this.stationPower(station) === "wired") {
+      void recycled.then(() => this.p2p.prewarm(station)).catch(() => {});
+    }
+    return recycled;
   }
 
   /**
