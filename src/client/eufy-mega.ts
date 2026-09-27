@@ -1138,7 +1138,7 @@ export class EufyMega extends EventEmitter {
    * Anker AIoT MQTT stack or the legacy Tuya REST router depending on the device's category
    * (`eufy_home_tuya` → Tuya, everything else → MQTT). The capability layer emits a single `aiot-dp`
    * kind and stays transport-agnostic; only the facade sees both sides and decides here. Everything
-   * else is P2P.
+   * else is RTC for a T9000 station and its attached devices, or P2P for other devices.
    */
   private routeCommand(sn: string, cmd: Command): Promise<void> {
     if (cmd.kind === "ff09-actuate" || cmd.kind === "ff09-autolock" || cmd.kind === "ff09-setting-toggle") {
@@ -1155,9 +1155,21 @@ export class EufyMega extends EventEmitter {
       if (dev.category === "eufy_home_tuya") return this.tuya.dispatchCommand(sn, cmd);
       return this.mqtt.dispatchCommand(sn, cmd);
     }
-    // A T9000 station has no reachable P2P endpoint: its writes ride the portal control channel.
-    const target = this.registry.list().find((d) => d.sn === sn);
-    if (target && RtcCommandRouter.claimsDevice(target)) return this.rtc.dispatchCommand(sn, cmd);
+    const devices = this.registry.list();
+    const target = devices.find((d) => d.sn === sn);
+    if (
+      target &&
+      (RtcCommandRouter.claimsDevice(target) ||
+        RtcCommandRouter.claimsMedia(target, (stationSn) => devices.find((d) => d.sn === stationSn)))
+    ) {
+      if (
+        target.stationSn &&
+        target.stationSn !== sn &&
+        this.registry.serialForFrame(target.stationSn, cmd.channel) !== sn
+      )
+        return Promise.reject(new Error("RTC command requires an unambiguous attached-device channel"));
+      return this.rtc.dispatchCommand(sn, cmd);
+    }
     return this.p2p.dispatchCommand(sn, cmd);
   }
 
