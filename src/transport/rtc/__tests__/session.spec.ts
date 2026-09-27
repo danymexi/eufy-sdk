@@ -39,7 +39,7 @@ const TURN: TurnConfig = { turn_addr: "13.248.157.102", turn_port: 3478, turn_us
 const HUB_SDP = {
   setup: "actpass",
   ice: { ufrag: "a", pwd: "b", fingerprint: "cd" },
-  candidate: ["1 1 udp 1 192.168.178.142 1 typ host"],
+  candidate: ["1 1 udp 1 192.168.1.10 1 typ host"],
 };
 
 function setup(overrides: { maxCallRetries?: number } = {}) {
@@ -49,7 +49,7 @@ function setup(overrides: { maxCallRetries?: number } = {}) {
   const session = new RtcSession({
     authToken: "T",
     userId: "u",
-    stationSn: "T9000P2026220AA6",
+    stationSn: "T9000P0000000001",
     adminUserId: "a",
     shard: "eu-pr",
     country: "IT",
@@ -114,17 +114,17 @@ describe("RtcSession", () => {
     await flush();
     expect(s.peer.handleRemoteOffer).toHaveBeenCalledTimes(1);
 
-    s.sig.hub({ action: 3, dataType: "info", data: { candidate: "1 1 udp 1 192.168.178.142 2 typ host" } });
+    s.sig.hub({ action: 3, dataType: "info", data: { candidate: "1 1 udp 1 192.168.1.10 2 typ host" } });
     s.sig.hub({
       action: 3,
       dataType: "info",
-      data: { format: "CANDIDATE", value: "1 1 udp 1 192.168.178.142 3 typ host" },
+      data: { format: "CANDIDATE", value: "1 1 udp 1 192.168.1.10 3 typ host" },
     });
     s.sig.hub({ action: 3, dataType: "info", data: { candidate: "" } });
     await flush();
     expect(s.peer.addRemoteCandidate.mock.calls.map((c) => c[0])).toEqual([
-      "1 1 udp 1 192.168.178.142 2 typ host",
-      "1 1 udp 1 192.168.178.142 3 typ host",
+      "1 1 udp 1 192.168.1.10 2 typ host",
+      "1 1 udp 1 192.168.1.10 3 typ host",
     ]);
 
     s.peer.emit("iceCandidate", "our-host");

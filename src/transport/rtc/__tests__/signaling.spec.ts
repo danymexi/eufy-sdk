@@ -80,7 +80,7 @@ function client(overrides: Partial<RtcSignalingOptions> = {}) {
   const c = new RtcSignalingClient({
     authToken: "TOKEN",
     userId: "user-1",
-    stationSn: "T9000P2026220AA6",
+    stationSn: "T9000P0000000001",
     adminUserId: "admin-1",
     shard: "eu-pr",
     country: "it",
@@ -189,7 +189,7 @@ describe("socket handshake", () => {
       code: 200,
       action: 1,
       data: "SIGNBLOB",
-      sn: "T9000P2026220AA6",
+      sn: "T9000P0000000001",
       source: "WEB",
       ts: 1_790_000_000,
     });
@@ -210,7 +210,7 @@ describe("socket handshake", () => {
       code: 200,
       action: 3,
       sessionId: "SIGNBLOB",
-      sn: "T9000P2026220AA6",
+      sn: "T9000P0000000001",
       subSn: "",
       channelId: 0,
       isResponse: 0,

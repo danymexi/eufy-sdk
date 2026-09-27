@@ -19,8 +19,8 @@ const HUB_JSON = {
     fingerprint: "0a1b2c3d",
   },
   candidate: [
-    "1 1 udp 2130706431 192.168.178.142 47470 typ host",
-    "2 1 udp 1694498815 93.48.234.159 47470 typ srflx raddr 192.168.178.142 rport 47470",
+    "1 1 udp 2130706431 192.168.1.10 47470 typ host",
+    "2 1 udp 1694498815 203.0.113.10 47470 typ srflx raddr 192.168.1.10 rport 47470",
   ],
 };
 
@@ -83,12 +83,12 @@ describe("candidate helpers", () => {
 describe("toWireCandidate", () => {
   it("carries the attribute's value, the way the hub sends its own", () => {
     // libdatachannel hands out the SDP line; the portal protocol carries what follows `a=`.
-    expect(toWireCandidate("a=candidate:2 1 UDP 2114977535 192.168.178.162 54012 typ host")).toBe(
-      "candidate:2 1 UDP 2114977535 192.168.178.162 54012 typ host",
+    expect(toWireCandidate("a=candidate:2 1 UDP 2114977535 192.168.1.20 54012 typ host")).toBe(
+      "candidate:2 1 UDP 2114977535 192.168.1.20 54012 typ host",
     );
     // Already in wire form, or an end-of-candidates marker: unchanged.
-    expect(toWireCandidate("candidate:1 1 udp 2122317823 192.168.178.142 47336 typ host")).toBe(
-      "candidate:1 1 udp 2122317823 192.168.178.142 47336 typ host",
+    expect(toWireCandidate("candidate:1 1 udp 2122317823 192.168.1.10 47336 typ host")).toBe(
+      "candidate:1 1 udp 2122317823 192.168.1.10 47336 typ host",
     );
     expect(toWireCandidate("")).toBe("");
   });
