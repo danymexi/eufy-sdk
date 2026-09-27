@@ -110,8 +110,8 @@ class FakePc implements NativePeerConnection {
   }
 }
 
-const HOST = "1 1 udp 2130706431 192.168.178.142 47470 typ host";
-const SRFLX = "2 1 udp 1694498815 93.48.234.159 47470 typ srflx raddr 192.168.178.142 rport 47470";
+const HOST = "1 1 udp 2130706431 192.168.1.10 47470 typ host";
+const SRFLX = "2 1 udp 1694498815 203.0.113.10 47470 typ srflx raddr 192.168.1.10 rport 47470";
 const OFFER = scallJsonToSdp({
   setup: "actpass",
   ice: { ufrag: "u", pwd: "p", fingerprint: "ab" },
