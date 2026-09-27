@@ -221,7 +221,11 @@ export interface ValueMember {
    * capability gets one, and the reason a structured DP payload can be read without the transport
    * knowing what its fields mean.
    */
-  decode?: (raw: unknown, codec: RawDpCodec | undefined, ctx: CommandContext) => boolean | number | string | undefined;
+  decode?: (
+    raw: unknown,
+    codec: RawDpCodec | undefined,
+    ctx: AvailabilityContext,
+  ) => boolean | number | string | undefined;
   /**
    * This member's value is also a FIELD of another member's payload.
    *
@@ -626,6 +630,7 @@ export function propertiesOf(members: Members, ctx?: AvailabilityContext): Prope
         // A member with a getter-side `decode` reads a field out of a structured payload, so the
         // stored value is that payload — see `PropertySpec.raw`.
         raw: m.decode ? true : undefined,
+        unexposed: m.unexposed,
         readAliases: aliases?.slice(promoted ? 1 : 0).map(({ paramType, invert }) => ({ paramType, invert })),
         writable: m.write !== undefined || m.writtenElsewhere === true,
         description: m.description,
@@ -907,12 +912,11 @@ export function bindMembers<M extends Members>(members: M, deps: MemberDeps): Su
       if (installs(m, ctx)) out[name] = describe(m.description, () => sink.dispatch(m.action(ctx)), {});
       continue;
     }
-    const prop = m.property ?? name;
     // A `readsFrom` member reads a FIELD of another member's payload — a sibling's, or one owned by
     // another capability in the same line. Borrowing nothing costs the getter rather than throwing at
     // bind time; the guard catches that case at build time.
     const from = borrowedBy(m, members);
-    const borrowed = from?.property;
+
     // One availability decision across getter, setter and manifest: a member gated off by `available`
     // for this device is not exposed as a getter either (the manifest already omits it).
     const available = !m.available || m.available(ctx);
@@ -920,11 +924,9 @@ export function bindMembers<M extends Members>(members: M, deps: MemberDeps): Su
     // carries the same value on the other device family.
     const reported = available && (reads(m, ctx) || (from !== undefined && ctx.paramIds.has(from.param)));
     if (reported && !m.writeOnly && !m.unexposed) {
-      const decode = m.decode;
       // The member's own wire wins; the owner's payload is the fallback for a device that does not
       // speak it. One `decode` sees whichever arrived and discriminates on the value's shape.
-      const raw = (): unknown => read(prop)?.value ?? (borrowed === undefined ? undefined : read(borrowed)?.value);
-      const get = decode ? () => decode(raw(), rawDp, ctx) : () => narrow(m.type, read, prop);
+      const get = () => readMemberValue(name, m, members, read, ctx, rawDp);
       Object.defineProperty(out, name, { get, enumerable: true, configurable: true });
     }
     if (!m.write || m.unverified || !installs(m, ctx)) continue;
@@ -990,3 +992,52 @@ export const unobservableMembers = (surface: object): readonly string[] => state
  * Empty for any object that is not a bound capability.
  */
 export const unreflectedMembers = (surface: object): readonly string[] => statement(surface, UNREFLECTED);
+
+/**
+ * A member's typed cached value, sharing the fluent getter's decoder and borrowed source.
+ * @internal
+ */
+export function readMemberValue(
+  name: string,
+  m: ValueMember,
+  members: Members,
+  read: CapabilityStateReader,
+  ctx: AvailabilityContext,
+  rawDp?: RawDpCodec,
+): boolean | number | string | undefined {
+  const prop = m.property ?? name;
+  if (!m.decode) return narrow(m.type, read, prop);
+  const borrowed = borrowedBy(m, members)?.property;
+  const raw = read(prop)?.value ?? (borrowed === undefined ? undefined : read(borrowed)?.value);
+  return m.decode(raw, rawDp, ctx);
+}
+
+/** A scalar read's schema, distinct from the parameter storage schema. @internal */
+export function scalarSpec(spec: PropertySpec, m: ValueMember): PropertySpec {
+  if (!m.decode || m.unexposed) return spec;
+  const kind = m.decodedKind ?? spec.kind;
+  const type =
+    kind === "boolean"
+      ? "bool"
+      : kind === "enum"
+        ? m.decodedValues?.some((v) => typeof v === "string")
+          ? "string"
+          : "enum"
+        : kind === "text"
+          ? "string"
+          : [
+                "scalar",
+                "seconds",
+                "hours",
+                "percent",
+                "bitfield",
+                "celsius",
+                "dbm",
+                "megabytes",
+                "degrees",
+                "timestamp",
+              ].includes(kind ?? "")
+            ? "number"
+            : spec.type;
+  return { ...spec, type, kind, values: m.decodedValues, raw: undefined, decode: undefined };
+}
