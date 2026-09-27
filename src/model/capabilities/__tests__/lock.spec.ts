@@ -153,12 +153,12 @@ describe("lock capability module", () => {
     expect("getAutoLockState" in acts).toBe(false);
   });
 
-  it("detects via the lock and safe model-name regexes", () => {
-    const [lockRe, safeRe] = LOCK.detection!.modelHints!;
-    expect(lockRe.test("Smart Lock")).toBe(true);
-    expect(lockRe.test("Indoor Cam")).toBe(false);
-    expect(safeRe.test("Smart Safe")).toBe(true);
-    expect(safeRe.test("Indoor Cam")).toBe(false);
+  it("detects lock and safe model facts without owner-assigned names", () => {
+    const detect = LOCK.detection!.detect!;
+    expect(detect({ model: "Smart Lock" }, "camera")).toBe(true);
+    expect(detect({ model: "Smart Safe" }, "camera")).toBe(true);
+    expect(detect({ model: "Indoor Cam" }, "camera")).toBe(false);
+    expect(detect({ model: "Indoor Cam", name: "Synthetic safe view" }, "camera")).toBe(false);
   });
 
   it("maps locked property to verified param 6000 and battery to param 1101 with alias 6001", () => {
