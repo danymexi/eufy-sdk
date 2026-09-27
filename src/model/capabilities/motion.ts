@@ -4,6 +4,7 @@ import { describeDevice, setJson, setJsonRaw, setPayload, setScalar } from "./ac
 import { propertiesOf, type Members, type Surface, type MemberDeps } from "./members.js";
 import { DeviceType } from "../device-types.js";
 import type {
+  AvailabilityContext,
   CapabilityActions,
   CapabilityModule,
   CapabilityStateReader,
@@ -598,6 +599,7 @@ export const MOTION_MEMBERS = {
    * `MOTION_CMD.SENSOR_PIR_SENSITIVITY`), which is exactly why it is `unexposed`.
    */
   sensorPirSensitivity: {
+    available: (ctx: AvailabilityContext) => ctx.codec === "sensor",
     param: MOTION_CMD.SENSOR_PIR_SENSITIVITY,
     type: "number",
     kind: "scalar",
@@ -612,10 +614,10 @@ export const MOTION_MEMBERS = {
    * reported it.
    *
    * The write is the one asymmetric pair here — enter is a `1350` payload carrying the channel, leave is
-   * a direct-binary frame, and each is refused in the other's shape. Sensor-family only; a camera
-   * throws via `requireFamily`.
+   * a direct-binary frame, and each is refused in the other's shape. Sensor-family only; unavailable on cameras.
    */
   testMode: {
+    available: (ctx: AvailabilityContext) => ctx.codec === "sensor",
     param: MOTION_CMD.SENSOR_WORK_MODE,
     type: "bool",
     kind: "boolean",
