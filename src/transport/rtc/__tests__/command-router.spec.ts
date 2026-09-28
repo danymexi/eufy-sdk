@@ -225,6 +225,82 @@ describe("RtcCommandRouter", () => {
     }
   });
 
+  it("accepts a control result notification correlated by channel, parameter and segment", async () => {
+    const { router, sessions } = makeRouter();
+    try {
+      await router.dispatchCommand(SN, arming(1));
+      const session = sessions[0]!;
+      session.behaviour = "silent";
+      const operation = router.dispatchCommand(CAMERA, {
+        kind: "set-json",
+        param: 6030,
+        data: { cmd_type: 1, rotate_type: 1, zoom: 1 },
+        channel: 2,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      const header = sent(session.sent[1]!);
+      const body = Buffer.from(JSON.stringify({ cmd: 6030, payload: { limit: 0 } }));
+      session.emit("commandData", Buffer.concat([buildPortalHeader(1351, body.length, 2, header.segment, 0), body]), 3);
+      await operation;
+      expect(session.sent).toHaveLength(2);
+      expect(session.closed).toBe(false);
+    } finally {
+      router.close();
+    }
+  });
+
+  it.each([
+    { label: "wrong segment", segment: 99 },
+    { label: "unsolicited segment", segment: 0 },
+    { label: "wrong channel", channel: 3 },
+    { label: "wrong parameter", param: 6034 },
+    { label: "wrong envelope", envelope: 1700 },
+    { label: "command link", link: 1 },
+    { label: "response flag", response: 1 },
+    { label: "missing payload", payload: undefined },
+    { label: "null payload", payload: null },
+    { label: "array payload", payload: [] },
+    { label: "scalar payload", payload: 1 },
+  ])("does not complete a control command on $label", async (over) => {
+    const { router, sessions } = makeRouter({ ackTimeoutMs: 100 });
+    try {
+      await router.dispatchCommand(SN, arming(1));
+      const session = sessions[0]!;
+      session.behaviour = "silent";
+      const operation = router.dispatchCommand(CAMERA, {
+        kind: "set-json",
+        param: 6030,
+        data: { cmd_type: 1, rotate_type: 1, zoom: 1 },
+        channel: 2,
+      });
+      const assertion = expect(operation).rejects.toThrow("ACK timed out");
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      const header = sent(session.sent[1]!);
+      const cfg = {
+        segment: header.segment,
+        channel: 2,
+        param: 6030,
+        envelope: 1351,
+        link: 3,
+        response: 0,
+        payload: { limit: 0 },
+        ...over,
+      };
+      const body = Buffer.from(JSON.stringify({ cmd: cfg.param, payload: cfg.payload }));
+      session.emit(
+        "commandData",
+        Buffer.concat([buildPortalHeader(cfg.envelope, body.length, cfg.channel, cfg.segment, cfg.response), body]),
+        cfg.link,
+      );
+      await assertion;
+      expect(session.sent).toHaveLength(2);
+      expect(session.listenerCount("commandData")).toBe(0);
+      expect(session.closed).toBe(false);
+    } finally {
+      router.close();
+    }
+  });
+
   it("requires a command-link ACK with the matching outer envelope and segment without replay", async () => {
     const { router, sessions } = makeRouter({ ackTimeoutMs: 500 });
     try {
