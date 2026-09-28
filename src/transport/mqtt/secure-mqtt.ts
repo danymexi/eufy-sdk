@@ -20,11 +20,22 @@ import { bareIpTlsOptions } from "./bare-ip-tls.js";
 import { parseSecureTopic, subscribeTopics } from "./topics.js";
 
 /**
- * SUBACK return code for a refused subscription. AWS IoT answers a policy-denied topic filter with
- * this grant instead of failing the SUBSCRIBE, so a wrong-scope credential subscribes "successfully"
- * and then receives nothing — the failure mode that hid the `eufy_life` credential split.
+ * The bit a SUBACK return code carries when the broker refused the filter (`0x80` in MQTT 3.1.1, any
+ * code at or above it in MQTT 5). AWS IoT answers a policy-denied topic filter with such a grant
+ * instead of failing the SUBSCRIBE, so a wrong-scope credential is refused per topic, not per request.
  */
 const SUBACK_FAILURE = 0x80;
+
+/**
+ * Whether a rejected `subscribeAsync` is the broker refusing the filter. The MQTT engine rejects the
+ * WHOLE request when any one grant has the {@link SUBACK_FAILURE} bit (`Subscribe error: Unspecified
+ * error`) and attaches the SUBACK it received as `packet`. A rejection that carries no SUBACK — a
+ * dropped connection, a client that is not connected — is a transport failure and answers false.
+ */
+function isRefusal(err: unknown): boolean {
+  const granted = (err as { packet?: { granted?: unknown } } | null)?.packet?.granted;
+  return Array.isArray(granted) && granted.some((g) => typeof g === "number" && (g & SUBACK_FAILURE) !== 0);
+}
 
 /**
  * Whether a connect failed because the broker REFUSED the client — a CONNACK return code the client
@@ -96,6 +107,13 @@ export interface SecureMqttOptions {
 export class SecureMqtt extends EventEmitter implements RealtimeTransport {
   readonly kind = "smqtt" as const;
   private client?: MqttClient;
+  /**
+   * The in-flight or established connect. A client ID is exclusive at the broker, so a second mqtt.js
+   * client under the same ID evicts the first, which reconnects and evicts it back, forever; `connect()`
+   * therefore hands a later caller this same attempt instead of opening a rival. Cleared when the
+   * attempt fails and on `disconnect()`, so a caller can still retry or deliberately reconnect.
+   */
+  private connecting?: Promise<void>;
   private readonly o: SecureMqttOptions;
   private readonly logger: Logger;
 
@@ -109,11 +127,20 @@ export class SecureMqtt extends EventEmitter implements RealtimeTransport {
     return this.o.clientId ?? this.o.credentials.thing_name ?? "";
   }
 
+  /** Connect, joining the attempt in `connecting` when one is already opening or open. */
+  async connect(): Promise<void> {
+    this.connecting ??= this.open().catch((error: unknown) => {
+      this.connecting = undefined;
+      throw error;
+    });
+    return await this.connecting;
+  }
+
   /**
    * Open the broker connection, resolving once it is established. Pinned to a broker instance's IP, or
    * to the plain hostname; only the former needs its own TLS shape, see `./bare-ip-tls.ts`.
    */
-  async connect(): Promise<void> {
+  private async open(): Promise<void> {
     // The engine, not at import: see ./engine.ts. This method already returned a promise, so awaiting
     // a module load in front of a TLS connect changes nothing a caller can observe.
     const mqtt = await loadMqtt();
@@ -190,18 +217,16 @@ export class SecureMqtt extends EventEmitter implements RealtimeTransport {
 
   /**
    * Subscribe every inbound leg this device's line uses (see `topics.ts` — one `/res` for most lines,
-   * four topics for `eufy_life`).
+   * four topics for `eufy_life` and the clean line).
    *
-   * The grants are INSPECTED, not assumed: AWS IoT answers a policy-denied filter with a
-   * SUBACK_FAILURE (`0x80`) grant rather than failing the SUBSCRIBE, so subscribing with a credential
-   * whose scope doesn't cover the topic looks identical to success and then delivers nothing. A denied
-   * topic is reported via `error` naming the credential scope; only an all-denied device throws, so a
-   * line that grants its state channel but refuses (say) the OTA leg still works.
+   * The grants are INSPECTED, not assumed: AWS IoT refuses a policy-denied filter with a
+   * {@link SUBACK_FAILURE} grant rather than failing the connection. A denied topic is reported via
+   * `error` naming the credential scope; only an all-denied device throws, so a line that grants its
+   * state channel but refuses (say) a business leg still works.
    */
   async subscribeDevice(device: EufyDevice): Promise<void> {
-    if (!this.client) throw new Error("SecureMqtt not connected");
     const topics = [...subscribeTopics(device)];
-    const { denied } = this.partitionGrants(await this.client.subscribeAsync(topics, { qos: 1 }));
+    const { denied } = await this.subscribeEach(topics);
     const scope = this.o.credentials.app_name ?? "default";
     if (denied.length === topics.length) {
       throw new Error(
@@ -216,27 +241,42 @@ export class SecureMqtt extends EventEmitter implements RealtimeTransport {
 
   /**
    * Subscribe to explicit topic filters, returning the topics that were granted. A scope-denied filter
-   * comes back with SUBACK_FAILURE rather than an error (AWS IoT quirk), so it is dropped from the result
-   * instead of throwing — callers that need every leg check the returned list. Used by lines whose topic
-   * vocabulary isn't the eufy `subscribeTopics` shape (e.g. Anker Solix `dt/{app}/{pn}/{sn}`).
+   * is dropped from the result instead of throwing — callers that need every leg check the returned
+   * list. Used by lines whose topic vocabulary isn't the eufy `subscribeTopics` shape (e.g. Anker Solix
+   * `dt/{app}/{pn}/{sn}`).
    */
   async subscribe(topics: string[]): Promise<string[]> {
-    if (!this.client) throw new Error("SecureMqtt not connected");
-    return this.partitionGrants(await this.client.subscribeAsync(topics, { qos: 1 })).granted;
+    return (await this.subscribeEach(topics)).granted;
   }
 
   /**
-   * Split SUBACK grants into granted vs scope-denied topics. AWS IoT marks a policy-denied filter with a
-   * SUBACK_FAILURE (`0x80`) grant rather than failing the SUBSCRIBE, so the two subscribe paths share
-   * this split and layer their own policy (drop vs report) on top.
+   * Subscribe each filter in a SUBSCRIBE of its own and split the outcome into granted vs refused.
+   *
+   * One request per filter because the MQTT engine treats a SUBACK as all-or-nothing: one refused grant
+   * rejects the whole request, and it forgets EVERY filter of that request for resubscription after a
+   * reconnect — so a batch holding one denied leg would lose the granted legs on the next drop. Alone,
+   * a refused filter costs only itself. A rejection that carries no SUBACK is a transport failure and
+   * is thrown.
+   *
+   * The cost is one SUBSCRIBE and one SUBACK per filter instead of one per device — four for a
+   * four-leg line. They are sent concurrently, so the wall-clock cost is one round trip. Folding them
+   * back into one request brings back the lost resubscription.
    */
-  private partitionGrants(grants: ReadonlyArray<{ topic: string; qos: number }>): {
-    granted: string[];
-    denied: string[];
-  } {
+  private async subscribeEach(topics: readonly string[]): Promise<{ granted: string[]; denied: string[] }> {
+    const client = this.client;
+    if (!client) throw new Error("SecureMqtt not connected");
+    const outcomes = await Promise.allSettled(topics.map((topic) => client.subscribeAsync(topic, { qos: 1 })));
     const granted: string[] = [];
     const denied: string[] = [];
-    for (const g of grants) (g.qos === SUBACK_FAILURE ? denied : granted).push(g.topic);
+    outcomes.forEach((outcome, i) => {
+      const topic = topics[i]!;
+      if (outcome.status === "fulfilled") {
+        granted.push(topic);
+        return;
+      }
+      if (!isRefusal(outcome.reason)) throw outcome.reason;
+      denied.push(topic);
+    });
     return { granted, denied };
   }
 
@@ -257,6 +297,7 @@ export class SecureMqtt extends EventEmitter implements RealtimeTransport {
   }
 
   async disconnect(): Promise<void> {
+    this.connecting = undefined;
     await this.client?.endAsync(true);
     this.client = undefined;
   }
