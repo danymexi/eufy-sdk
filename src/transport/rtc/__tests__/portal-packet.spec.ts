@@ -69,6 +69,7 @@ describe("portal packet bodies", () => {
     const ok = Buffer.concat([buildPortalHeader(1350, 4, 255, 3, 1), Buffer.from([0, 0, 0, 0])]);
     expect(parsePortalPacket(ok)).toEqual({
       commandId: 1350,
+      channel: 255,
       segment: 3,
       isResponse: 1,
       linkType: PortalLinkType.COMMAND,
@@ -88,9 +89,10 @@ describe("portal packet bodies", () => {
 
   it("parses a notify frame as JSON with the nested cmd surfaced", () => {
     const json = Buffer.from(JSON.stringify({ cmd: 1351, payload: { params: [] } }) + "\0", "utf8");
-    const pkt = Buffer.concat([buildPortalHeader(1351, json.length, 0, 0, 0), json]);
+    const pkt = Buffer.concat([buildPortalHeader(1351, json.length, 2, 0, 0), json]);
     const parsed = parsePortalPacket(pkt, PortalLinkType.NOTIFY);
     expect(parsed?.cmd).toBe(1351);
+    expect(parsed?.channel).toBe(2);
     expect(parsed?.data).toEqual({ cmd: 1351, payload: { params: [] } });
     expect(parsed?.errCode).toBeUndefined();
   });
