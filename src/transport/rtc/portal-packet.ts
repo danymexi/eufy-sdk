@@ -49,6 +49,7 @@ export interface PortalRequest {
 
 export interface PortalResponse {
   commandId: number;
+  channel: number;
   segment: number;
   isResponse: number;
   linkType: number;
@@ -168,10 +169,19 @@ export function parsePortalPacket(buf: Buffer, linkType: number = PortalLinkType
     const data = parseJsonBody(body);
     const cmd =
       typeof data === "object" && data !== null && "cmd" in data ? Number((data as { cmd?: unknown }).cmd) : undefined;
-    return { commandId: header.commandId, segment: header.segment, isResponse: header.isResponse, linkType, cmd, data };
+    return {
+      commandId: header.commandId,
+      channel: header.channel,
+      segment: header.segment,
+      isResponse: header.isResponse,
+      linkType,
+      cmd,
+      data,
+    };
   }
   return {
     commandId: header.commandId,
+    channel: header.channel,
     segment: header.segment,
     isResponse: header.isResponse,
     linkType,

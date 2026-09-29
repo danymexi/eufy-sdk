@@ -3,10 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { EufyDevice } from "../../../core/types.js";
 import { RtcCommandRouter, type RtcCommandRouterDeps } from "../command-router.js";
 import type { RtcSession, RtcSessionOptions } from "../session.js";
-import { buildPortalHeader, parsePortalHeader, PORTAL_HEADER_LENGTH } from "../portal-packet.js";
+import { buildPortalHeader, parsePortalHeader, PortalLinkType, PORTAL_HEADER_LENGTH } from "../portal-packet.js";
 import { PORTAL_CMD_SET_PAYLOAD, PORTAL_STATION_CHANNEL } from "../commands.js";
 
-/** A stand-in for RtcSession: comes up on connect(), answers every send with a 1350 ACK unless told not to. */
+/** A stand-in for RtcSession that repeats the sent outer envelope and segment in its ACK. */
 class FakeSession extends EventEmitter {
   connected = false;
   closed = false;
@@ -33,12 +33,12 @@ class FakeSession extends EventEmitter {
     });
   }
   /** Inject an ACK for an arbitrary segment, as a hub answering late would. */
-  ackSegment(segment: number): void {
+  ackSegment(segment: number, commandId = PORTAL_CMD_SET_PAYLOAD, linkType: number = PortalLinkType.COMMAND): void {
     const body = Buffer.alloc(4);
     this.emit(
       "commandData",
-      Buffer.concat([buildPortalHeader(PORTAL_CMD_SET_PAYLOAD, body.length, PORTAL_STATION_CHANNEL, segment, 1), body]),
-      1,
+      Buffer.concat([buildPortalHeader(commandId, body.length, PORTAL_STATION_CHANNEL, segment, 1), body]),
+      linkType,
     );
   }
   sendCommand(pkt: Buffer): boolean {
@@ -47,13 +47,10 @@ class FakeSession extends EventEmitter {
     if (this.behaviour === "ack" || this.behaviour === "nack") {
       // The hub's ACK on the wire: response header repeating the request's segment + body whose first
       // int32 LE is the error code.
-      const segment = parsePortalHeader(pkt)!.segment;
+      const { segment, commandId } = parsePortalHeader(pkt)!;
       const body = Buffer.alloc(4);
       body.writeInt32LE(this.behaviour === "nack" ? 1 : 0, 0);
-      const ack = Buffer.concat([
-        buildPortalHeader(PORTAL_CMD_SET_PAYLOAD, body.length, PORTAL_STATION_CHANNEL, segment, 1),
-        body,
-      ]);
+      const ack = Buffer.concat([buildPortalHeader(commandId, body.length, PORTAL_STATION_CHANNEL, segment, 1), body]);
       queueMicrotask(() => this.emit("commandData", ack, 1));
     } else if (this.behaviour === "close") {
       queueMicrotask(() => this.close());
@@ -69,11 +66,19 @@ class FakeSession extends EventEmitter {
 }
 
 const SN = "T9000P0000000001";
+const CAMERA = "T8000P0000000002";
 const station = {
   sn: SN,
   model: "T9000",
   stationSn: SN,
   raw: { member: { admin_user_id: "adminid" } },
+} as unknown as EufyDevice;
+
+const camera = {
+  sn: CAMERA,
+  model: "T8425",
+  stationSn: SN,
+  raw: { device_channel: 2, member: { admin_user_id: "synthetic-child-member" } },
 } as unknown as EufyDevice;
 
 function makeRouter(over: Partial<RtcCommandRouterDeps> = {}) {
@@ -83,7 +88,7 @@ function makeRouter(over: Partial<RtcCommandRouterDeps> = {}) {
     shard: () => "ie-pr",
     country: "CH",
     accountName: () => "Home Assistant",
-    findDevice: (sn) => (sn === SN ? station : undefined),
+    findDevice: (sn) => (sn === SN ? station : sn === CAMERA ? camera : undefined),
     createSession: (opts) => {
       const s = new FakeSession(opts);
       sessions.push(s);
@@ -161,6 +166,167 @@ describe("RtcCommandRouter", () => {
     expect(sent(sessions[0]!.sent[1]!).body).toMatchObject({ payload: { mode_type: 2 } });
     // distinct segments, never 0 (the portal reserves it)
     expect(sent(sessions[0]!.sent[0]!).segment).not.toBe(sent(sessions[0]!.sent[1]!).segment);
+  });
+
+  it("shares the parent session and identity across station and attached-device envelopes", async () => {
+    const { router, sessions } = makeRouter();
+    try {
+      await Promise.all([
+        router.dispatchCommand(CAMERA, { kind: "set-json", param: 1400, data: { value: 1 }, channel: 2 }),
+        router.dispatchCommand(SN, arming(1)),
+        router.dispatchCommand(CAMERA, {
+          kind: "set-payload",
+          cmd: 1234,
+          payload: { value: 0 },
+          channel: 2,
+          mValue3: 7,
+        }),
+      ]);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]!.opts.stationSn).toBe(SN);
+      expect(sessions[0]!.opts.adminUserId).toBe("adminid");
+      const packets = sessions[0]!.sent.map(sent);
+      expect(packets.map((p) => p.channel)).toEqual([2, 255, 2]);
+      expect(packets.map((p) => p.commandId)).toEqual([1700, 1350, 1350]);
+      expect(packets[0]!.body).toEqual({ account_id: "adminid", cmd: 1400, commandType: 1400, data: { value: 1 } });
+      expect(packets[2]!.body).toEqual({ account_id: "adminid", cmd: 1234, mValue3: 7, payload: { value: 0 } });
+      expect(new Set(packets.map((p) => p.segment)).size).toBe(3);
+    } finally {
+      router.close();
+    }
+  });
+
+  it.each([-1, 1.5, 255, 256, NaN])("refuses invalid attached-device channel %s before connecting", async (channel) => {
+    const { router, sessions } = makeRouter();
+    await expect(router.dispatchCommand(CAMERA, { kind: "set-json", param: 1400, data: {}, channel })).rejects.toThrow(
+      /valid device channel/,
+    );
+    expect(sessions).toHaveLength(0);
+  });
+
+  it("does not open a child-owned session when the parent is missing or unsupported", async () => {
+    for (const parent of [undefined, { ...station, model: "T8030" }]) {
+      const { router, sessions } = makeRouter({ findDevice: (sn) => (sn === CAMERA ? camera : parent) });
+      await expect(
+        router.dispatchCommand(CAMERA, { kind: "set-json", param: 1400, data: {}, channel: 2 }),
+      ).rejects.toThrow(/known T9000 station/);
+      expect(sessions).toHaveLength(0);
+    }
+  });
+
+  it("uses the login identity when the parent has no member identity", async () => {
+    const { router, sessions } = makeRouter({ findDevice: (sn) => (sn === CAMERA ? camera : { ...station, raw: {} }) });
+    try {
+      await router.dispatchCommand(CAMERA, { kind: "set-json", param: 1400, data: {}, channel: 2 });
+      expect(sessions[0]!.opts.adminUserId).toBe("uid");
+      expect(sent(sessions[0]!.sent[0]!).body.account_id).toBe("uid");
+    } finally {
+      router.close();
+    }
+  });
+
+  it("accepts a control result notification correlated by channel, parameter and segment", async () => {
+    const { router, sessions } = makeRouter();
+    try {
+      await router.dispatchCommand(SN, arming(1));
+      const session = sessions[0]!;
+      session.behaviour = "silent";
+      const operation = router.dispatchCommand(CAMERA, {
+        kind: "set-json",
+        param: 6030,
+        data: { cmd_type: 1, rotate_type: 1, zoom: 1 },
+        channel: 2,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      const header = sent(session.sent[1]!);
+      const body = Buffer.from(JSON.stringify({ cmd: 6030, payload: { limit: 0 } }));
+      session.emit("commandData", Buffer.concat([buildPortalHeader(1351, body.length, 2, header.segment, 0), body]), 3);
+      await operation;
+      expect(session.sent).toHaveLength(2);
+      expect(session.closed).toBe(false);
+    } finally {
+      router.close();
+    }
+  });
+
+  it.each([
+    { label: "wrong segment", segment: 99 },
+    { label: "unsolicited segment", segment: 0 },
+    { label: "wrong channel", channel: 3 },
+    { label: "wrong parameter", param: 6034 },
+    { label: "wrong envelope", envelope: 1700 },
+    { label: "command link", link: 1 },
+    { label: "response flag", response: 1 },
+    { label: "missing payload", payload: undefined },
+    { label: "null payload", payload: null },
+    { label: "array payload", payload: [] },
+    { label: "scalar payload", payload: 1 },
+  ])("does not complete a control command on $label", async (over) => {
+    const { router, sessions } = makeRouter({ ackTimeoutMs: 100 });
+    try {
+      await router.dispatchCommand(SN, arming(1));
+      const session = sessions[0]!;
+      session.behaviour = "silent";
+      const operation = router.dispatchCommand(CAMERA, {
+        kind: "set-json",
+        param: 6030,
+        data: { cmd_type: 1, rotate_type: 1, zoom: 1 },
+        channel: 2,
+      });
+      const assertion = expect(operation).rejects.toThrow("ACK timed out");
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      const header = sent(session.sent[1]!);
+      const cfg = {
+        segment: header.segment,
+        channel: 2,
+        param: 6030,
+        envelope: 1351,
+        link: 3,
+        response: 0,
+        payload: { limit: 0 },
+        ...over,
+      };
+      const body = Buffer.from(JSON.stringify({ cmd: cfg.param, payload: cfg.payload }));
+      session.emit(
+        "commandData",
+        Buffer.concat([buildPortalHeader(cfg.envelope, body.length, cfg.channel, cfg.segment, cfg.response), body]),
+        cfg.link,
+      );
+      await assertion;
+      expect(session.sent).toHaveLength(2);
+      expect(session.listenerCount("commandData")).toBe(0);
+      expect(session.closed).toBe(false);
+    } finally {
+      router.close();
+    }
+  });
+
+  it("requires a command-link ACK with the matching outer envelope and segment without replay", async () => {
+    const { router, sessions } = makeRouter({ ackTimeoutMs: 500 });
+    try {
+      await router.dispatchCommand(SN, arming(1));
+      const session = sessions[0]!;
+      session.behaviour = "silent";
+      let settled = false;
+      const pending = router
+        .dispatchCommand(CAMERA, { kind: "set-json", param: 1400, data: {}, channel: 2 })
+        .then(() => {
+          settled = true;
+        });
+      await vi.waitFor(() => expect(session.sent).toHaveLength(2));
+      const segment = sent(session.sent[1]!).segment;
+      session.ackSegment(segment, PORTAL_CMD_SET_PAYLOAD);
+      session.ackSegment(segment + 1, 1700);
+      session.ackSegment(segment, 1700, PortalLinkType.NOTIFY);
+      expect(session.listenerCount("commandData")).toBe(1);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      session.ackSegment(segment, 1700);
+      await pending;
+      expect(session.sent).toHaveLength(2);
+    } finally {
+      router.close();
+    }
   });
 
   it("rejects an ACK that carries a non-zero error code", async () => {

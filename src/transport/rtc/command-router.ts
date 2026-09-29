@@ -15,17 +15,19 @@
  * `{account_id, cmd, mValue3, payload}`) on the station channel `255` — the exact frame the app sends
  * for arming (`cmd 1224`, `{mode_type, user_name}`), ✅ verified live end-to-end on a T9000 4.4.0.4
  * (2026-09-25 23:55): ACK `1350 err=0`, `1151` MODE_SWITCH pushed back, cloud state updated within 1 s.
+ * Attached-device commands share their parent station session and keep their device channel.
+ * `set-json` uses the `1700` CONTROL_PAYLOAD envelope with `{account_id, cmd, commandType, data}`.
  * Other command kinds are refused with a clear error rather than silently misrouted.
  *
  * One session per station, reused across commands and closed after {@link RtcCommandRouterDeps.idleCloseMs}
- * of inactivity. Sends on a session are serialised, because the `1350` ACK carries no inner `cmd` to
- * correlate on: the first ACK after a send belongs to that send.
+ * of inactivity. Sends on a session are serialised; an ACK is correlated by its outer command and
+ * segment, since it carries no inner command. An ACK is not an observation of the resulting state.
  */
 import type { Command } from "../../core/contracts.js";
 import type { EufyDevice } from "../../core/types.js";
 import type { Logger } from "../../core/logger.js";
 import { RtcSession, type RtcSessionOptions } from "./session.js";
-import { buildPortalPacket, parsePortalPacket, SegmentCounter } from "./portal-packet.js";
+import { buildPortalPacket, parsePortalPacket, PortalLinkType, SegmentCounter } from "./portal-packet.js";
 import { RtcLive, type RtcLiveConsumer } from "./live.js";
 import { openReadableFromConsumer } from "../p2p/readable-egress.js";
 import type { Consumer } from "../p2p/shared-live-source.js";
@@ -33,6 +35,12 @@ import { jpegGeometry } from "../p2p/media.js";
 import { LiveSnapshotUnavailableError, type MediaProvider, type LiveStreamConsumer } from "../../core/contracts.js";
 import { spawn } from "node:child_process";
 import { PORTAL_CMD_SET_PAYLOAD, PORTAL_STATION_CHANNEL } from "./commands.js";
+
+/** The CONTROL_PAYLOAD envelope for a commandType/data request. */
+const PORTAL_CMD_CONTROL_PAYLOAD = 1700;
+
+/** The envelope carrying a correlated JSON control result. */
+const PORTAL_CMD_NOTIFY_PAYLOAD = 1351;
 
 export interface RtcIdentity {
   authToken: string;
@@ -57,7 +65,7 @@ export interface RtcCommandRouterDeps {
   logger?: Logger;
   /** `relay` (default) or `all`. Never `host-only` — see the module doc. */
   icePolicy?: "relay" | "all";
-  /** How long a command waits for its `1350` ACK (default 8 s). */
+  /** How long a command waits for its envelope ACK (default 8 s). */
   ackTimeoutMs?: number;
   /**
    * How long to wait for the session to come up (default 12 s). A healthy hub answers in ~2 s; the
@@ -92,7 +100,7 @@ export class RtcCommandRouter {
 
   constructor(private readonly deps: RtcCommandRouterDeps) {}
 
-  /** A T9000 station itself. Attached cameras keep their own (P2P) path for now. */
+  /** A T9000 station itself. */
   static claimsDevice(dev: EufyDevice): boolean {
     return /^T9000/i.test(dev.model ?? "") && (!dev.stationSn || dev.stationSn === dev.sn);
   }
@@ -105,26 +113,38 @@ export class RtcCommandRouter {
   }
 
   async dispatchCommand(sn: string, cmd: Command): Promise<void> {
-    if (cmd.kind !== "set-payload") {
-      throw new Error(`rtc: ${cmd.kind} is not routable over the T9000 control channel yet (only set-payload)`);
+    if (cmd.kind !== "set-payload" && cmd.kind !== "set-json") {
+      throw new Error(
+        `rtc: ${cmd.kind} is not routable over the T9000 control channel yet (only set-payload or set-json)`,
+      );
     }
     const dev = this.deps.findDevice(sn);
+    const stationSn = dev?.stationSn || sn;
+    const station = this.deps.findDevice(stationSn);
+    if (!dev || !station || !RtcCommandRouter.claimsDevice(station))
+      throw new Error("RTC command requires a known T9000 station or attached device");
+    const channel = stationSn === sn ? PORTAL_STATION_CHANNEL : cmd.channel;
+    if (
+      !Number.isInteger(channel) ||
+      channel < 0 ||
+      channel > PORTAL_STATION_CHANNEL ||
+      (stationSn !== sn && channel === PORTAL_STATION_CHANNEL)
+    )
+      throw new RangeError("RTC command requires a valid device channel");
     const identity = this.deps.identity();
     if (!identity) throw new Error(`rtc: not logged in, cannot drive ${sn}`);
-    // Same identity the P2P router attributes station writes to: the record's member id, else the login.
-    const member = ((dev?.raw ?? {}) as { member?: { admin_user_id?: unknown } }).member;
+    const member = ((station.raw ?? {}) as { member?: { admin_user_id?: unknown } }).member;
     const adminUserId = (typeof member?.admin_user_id === "string" && member.admin_user_id) || identity.userId;
-    const st = await this.stationSession(sn, adminUserId, identity);
-    // A station-scoped command rides the broadcast channel; a device-scoped one keeps its own.
-    const channel = !dev?.stationSn || dev.stationSn === sn ? PORTAL_STATION_CHANNEL : cmd.channel;
+    const st = await this.stationSession(stationSn, adminUserId, identity);
+    const outerCmd = cmd.kind === "set-json" ? PORTAL_CMD_CONTROL_PAYLOAD : PORTAL_CMD_SET_PAYLOAD;
+    const innerCmd = cmd.kind === "set-json" ? cmd.param : cmd.cmd;
+    const payload =
+      cmd.kind === "set-json"
+        ? { account_id: adminUserId, cmd: cmd.param, commandType: cmd.param, data: cmd.data }
+        : { account_id: adminUserId, cmd: cmd.cmd, mValue3: cmd.mValue3 ?? 0, payload: cmd.payload };
     const segment = st.seg.next();
-    const packet = buildPortalPacket({
-      commandId: PORTAL_CMD_SET_PAYLOAD,
-      channel,
-      segment,
-      payload: { account_id: adminUserId, cmd: cmd.cmd, mValue3: cmd.mValue3 ?? 0, payload: cmd.payload },
-    });
-    const run = st.queue.then(() => this.sendAwaitAck(sn, st, packet, cmd.cmd, segment));
+    const packet = buildPortalPacket({ commandId: outerCmd, channel, segment, payload });
+    const run = st.queue.then(() => this.sendAwaitAck(stationSn, st, packet, outerCmd, innerCmd, channel, segment));
     st.queue = run.catch(() => undefined);
     return run;
   }
@@ -143,21 +163,43 @@ export class RtcCommandRouter {
     }
   }
 
+  /**
+   * Completes on the command ACK or a correlated control-result notification. The notification must
+   * match the request channel, parameter and segment and contain a structured payload. Receipt does
+   * not establish physical actuation. The command is sent once and retains the existing deadline.
+   */
   private sendAwaitAck(
     sn: string,
     st: StationSession,
     packet: Buffer,
+    outerCmd: number,
     innerCmd: number,
+    channel: number,
     segment: number,
   ): Promise<void> {
     const timeoutMs = this.deps.ackTimeoutMs ?? 8_000;
     return new Promise<void>((resolve, reject) => {
       const onData = (frame: Buffer, linkType: number) => {
         const p = parsePortalPacket(frame, linkType);
-        // The hub's ACK repeats the request's segment — correlate on it, since a live view shares this session.
-        if (!p || p.commandId !== PORTAL_CMD_SET_PAYLOAD || !p.isResponse || p.segment !== segment) return;
+        if (!p || p.segment !== segment) return;
+        const acknowledgement = linkType === PortalLinkType.COMMAND && p.commandId === outerCmd && !!p.isResponse;
+        const notification =
+          outerCmd === PORTAL_CMD_CONTROL_PAYLOAD &&
+          linkType === PortalLinkType.NOTIFY &&
+          p.commandId === PORTAL_CMD_NOTIFY_PAYLOAD &&
+          p.isResponse === 0 &&
+          p.channel === channel &&
+          p.cmd === innerCmd &&
+          typeof p.data === "object" &&
+          p.data !== null &&
+          !Array.isArray(p.data) &&
+          "payload" in p.data &&
+          typeof p.data.payload === "object" &&
+          p.data.payload !== null &&
+          !Array.isArray(p.data.payload);
+        if (!acknowledgement && !notification) return;
         cleanup();
-        if (p.errCode && p.errCode !== 0) {
+        if (acknowledgement && p.errCode !== 0) {
           reject(new Error(`rtc: ${sn} rejected cmd ${innerCmd} (err ${p.errCode})`));
         } else {
           this.deps.logger?.debug?.(`[rtc] ${sn} cmd ${innerCmd} acked`);
