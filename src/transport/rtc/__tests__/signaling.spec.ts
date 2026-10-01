@@ -4,9 +4,6 @@ import {
   PORTAL_ORIGIN,
   RtcSignError,
   RtcSignalingClient,
-  SMART_HOST_BY_SHARD,
-  base64urlJson,
-  gtokenFromUserId,
   sessionAccount,
   type RtcSignalingOptions,
   type SignalingSocket,
@@ -79,7 +76,7 @@ function client(overrides: Partial<RtcSignalingOptions> = {}) {
   const sockets: FakeSocket[] = [];
   const c = new RtcSignalingClient({
     authToken: "TOKEN",
-    userId: "user-1",
+    gtoken: "GTOKEN",
     stationSn: "T9000P0000000001",
     adminUserId: "admin-1",
     shard: "eu-pr",
@@ -100,8 +97,8 @@ function client(overrides: Partial<RtcSignalingOptions> = {}) {
 describe("region rules", () => {
   it("derives host and cluster from the mega shard, and sends the country only on the sign request", async () => {
     const { c } = client();
-    expect(c.signUrl).toBe(`https://${SMART_HOST_BY_SHARD["eu-pr"]}/v1/smart/nvr/ws/sign`);
-    expect(c.wsUrl).toBe(`wss://${SMART_HOST_BY_SHARD["eu-pr"]}/v1/rtc/ws/join?reqtype=nvr`);
+    expect(c.signUrl).toBe("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign");
+    expect(c.wsUrl).toBe("wss://security-smart-eu.eufylife.com/v1/rtc/ws/join?reqtype=nvr");
     expect(c.subprotocolPayload("S").region).toBe("EU");
     const us = client({ shard: "us-pr", country: "US" }).c;
     expect(us.signUrl).toContain("security-smart.eufylife.com");
@@ -114,28 +111,21 @@ describe("region rules", () => {
     expect(ie.subprotocolPayload("S").region).toBe("IE");
   });
 
-  it("derives a regional smart host + cluster for a shard not in the table", () => {
-    const de = client({ shard: "de-pr" as never, country: "DE" }).c;
+  it("derives a regional smart host + cluster for any other shard prefix", () => {
+    const de = client({ shard: "de-pr", country: "DE" }).c;
     expect(de.signUrl).toBe("https://security-smart-de.eufylife.com/v1/smart/nvr/ws/sign");
     expect(de.subprotocolPayload("S").region).toBe("DE");
-    const us2 = client({ shard: "us-2" as never, country: "US" }).c;
+    const us2 = client({ shard: "us-2", country: "US" }).c;
     expect(us2.signUrl).toContain("security-smart.eufylife.com");
     expect(us2.subprotocolPayload("S").region).toBe("US");
   });
 
-  it("hashes gtoken from the account user id, not the ap_cloud userId, and honors an explicit gtoken", async () => {
-    // ap_cloud userId differs from the account user_id whose md5 is the gtoken.
-    const withAccount = client({ userId: "ap-cloud-id", accountUserId: "account-id" });
-    const fetchImpl = withAccount.c["fetchImpl"] as ReturnType<typeof vi.fn>;
-    await withAccount.c.fetchSign();
-    expect((fetchImpl.mock.calls[0][1] as RequestInit).headers).toMatchObject({
-      GToken: gtokenFromUserId("account-id"),
-    });
-    // account id also drives the socket payload's gtoken
-    expect(withAccount.c.subprotocolPayload("S").gtoken).toBe(gtokenFromUserId("account-id"));
-    // an explicit gtoken wins over any derivation
-    const explicit = client({ userId: "x", accountUserId: "y", gtoken: "VERBATIM" }).c;
-    expect(explicit.subprotocolPayload("S").gtoken).toBe("VERBATIM");
+  it("sends the session's gtoken verbatim on the sign and in the socket payload", async () => {
+    const { c } = client({ gtoken: "VERBATIM" });
+    const fetchImpl = c["fetchImpl"] as ReturnType<typeof vi.fn>;
+    await c.fetchSign();
+    expect((fetchImpl.mock.calls[0][1] as RequestInit).headers).toMatchObject({ GToken: "VERBATIM" });
+    expect(c.subprotocolPayload("S").gtoken).toBe("VERBATIM");
   });
 
   it("sends the portal's sign headers exactly", async () => {
@@ -149,12 +139,12 @@ describe("region rules", () => {
       "X-Auth-Token": "TOKEN",
       "App-Name": "eufy_mega",
       "Model-Type": "WEB",
-      GToken: gtokenFromUserId("user-1"),
+      GToken: "GTOKEN",
       Origin: PORTAL_ORIGIN,
     });
   });
 
-  it("types a refused sign, and knows a revoked token when the portal says so", async () => {
+  it("types a refused sign with its HTTP status and API code", async () => {
     const refused = vi.fn(async () => ({
       ok: false,
       status: 401,
@@ -164,9 +154,7 @@ describe("region rules", () => {
     const err = await c.fetchSign().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(RtcSignError);
     expect((err as RtcSignError).httpStatus).toBe(401);
-    expect((err as RtcSignError).tokenRevoked).toBe(true);
-    const forbidden = new RtcSignError("HTTP 403 Request Failed", 403, undefined);
-    expect(forbidden.tokenRevoked).toBe(false);
+    expect((err as RtcSignError).apiCode).toBe(26000);
   });
 });
 
@@ -177,7 +165,9 @@ describe("socket handshake", () => {
     const s = await socketOf(sockets);
     expect(s.url).toBe(c.wsUrl);
     expect(s.protocols[0]).toBe("v1");
-    expect(s.protocols[1]).toBe(base64urlJson(c.subprotocolPayload("SIGNBLOB")));
+    expect(JSON.parse(Buffer.from(s.protocols[1]!, "base64url").toString("utf8"))).toEqual(
+      c.subprotocolPayload("SIGNBLOB"),
+    );
     expect(s.protocols[1]).not.toMatch(/[+/=]/);
     expect(s.origin).toBe("https://security.eufy.com");
     s.open();

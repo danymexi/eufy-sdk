@@ -286,6 +286,7 @@ export class EufyMega extends EventEmitter {
   private readonly prewarmTiers: ReadonlySet<PowerTier>;
   /** Transport-side owner of the P2P sessions + all wire senders. */
   private readonly p2p: P2PCommandRouter;
+  /** Transport-side owner of the T9000 station sessions (sibling of {@link p2p}). */
   private readonly rtc: RtcCommandRouter;
   /** Transport-side owner of the secure-MQTT ff09 lock/garage command path (sibling of {@link p2p}). */
   private readonly mqtt: MqttCommandRouter;
@@ -358,15 +359,8 @@ export class EufyMega extends EventEmitter {
       identity: () => this.mega.rtcIdentity(),
       shard: () => this.mega.rtcShard,
       country: opts.countryCode,
-      accountName: () => this.mega.accountName,
       findDevice: (sn) => this.registry.list().find((d) => d.sn === sn),
       logger: opts.logger,
-      icePolicy: opts.rtc?.icePolicy,
-      ackTimeoutMs: opts.rtc?.ackTimeoutMs,
-      connectTimeoutMs: opts.rtc?.connectTimeoutMs,
-      idleCloseMs: opts.rtc?.idleCloseMs,
-      ffmpegPath: opts.ffmpegPath,
-      ffmpegLogLevel: opts.ffmpegLogLevel,
       onError: (e) => this.reportError(e),
     });
     this.mqtt = new MqttCommandRouter({
@@ -1086,13 +1080,7 @@ export class EufyMega extends EventEmitter {
    * current. With nothing retained the refusal stands.
    */
   private mediaProviderFor(sn: string): MediaProvider {
-    // A camera on a T9000 has no P2P live; its video rides the station's control channel.
-    const target = this.registry.list().find((d) => d.sn === sn);
-    const media =
-      target &&
-      RtcCommandRouter.claimsMedia(target, (stationSn) => this.registry.list().find((d) => d.sn === stationSn))
-        ? this.rtc.mediaProviderFor(sn)
-        : this.p2p.mediaProviderFor(sn);
+    const media = this.p2p.mediaProviderFor(sn);
     const cache = this.storedImages;
     if (!cache) return media;
     const retainedStill = () => {
@@ -1128,8 +1116,9 @@ export class EufyMega extends EventEmitter {
    * The `eufy_life` DP writes (smart lights) are secure-MQTT-only. `aiot-dp` routes to either the
    * Anker AIoT MQTT stack or the legacy Tuya REST router depending on the device's category
    * (`eufy_home_tuya` → Tuya, everything else → MQTT). The capability layer emits a single `aiot-dp`
-   * kind and stays transport-agnostic; only the facade sees both sides and decides here. Everything
-   * else is RTC for a T9000 station and its attached devices, or P2P for other devices.
+   * kind and stays transport-agnostic; only the facade sees both sides and decides here. A T9000
+   * station and the devices attached to it go over RTC, with an attached device's command refused
+   * unless its channel resolves back to it on the station. Everything else is P2P.
    */
   private routeCommand(sn: string, cmd: Command): Promise<void> {
     if (cmd.kind === "ff09-actuate" || cmd.kind === "ff09-autolock" || cmd.kind === "ff09-setting-toggle") {
@@ -1151,7 +1140,7 @@ export class EufyMega extends EventEmitter {
     if (
       target &&
       (RtcCommandRouter.claimsDevice(target) ||
-        RtcCommandRouter.claimsMedia(target, (stationSn) => devices.find((d) => d.sn === stationSn)))
+        RtcCommandRouter.claimsAttached(target, (stationSn) => devices.find((d) => d.sn === stationSn)))
     ) {
       if (
         target.stationSn &&

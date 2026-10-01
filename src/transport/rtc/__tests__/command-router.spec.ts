@@ -4,7 +4,28 @@ import type { EufyDevice } from "../../../core/types.js";
 import { RtcCommandRouter, type RtcCommandRouterDeps } from "../command-router.js";
 import type { RtcSession, RtcSessionOptions } from "../session.js";
 import { buildPortalHeader, parsePortalHeader, PortalLinkType, PORTAL_HEADER_LENGTH } from "../portal-packet.js";
-import { PORTAL_CMD_SET_PAYLOAD, PORTAL_STATION_CHANNEL } from "../commands.js";
+
+const PORTAL_CMD_SET_PAYLOAD = 1350;
+const PORTAL_STATION_CHANNEL = 255;
+const ACK_TIMEOUT_MS = 8_000;
+const CONNECT_TIMEOUT_MS = 12_000;
+
+/** Run `fn` on fake timers, so the router's fixed deadlines can be crossed without waiting them out. */
+async function onFakeTimers(fn: () => Promise<void>): Promise<void> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await fn();
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** Await `promise` to reject with `pattern` once `ms` of fake time has passed. */
+async function rejectsAfter(promise: Promise<unknown>, pattern: RegExp | string, ms: number): Promise<void> {
+  const settled = expect(promise).rejects.toThrow(pattern);
+  await vi.advanceTimersByTimeAsync(ms);
+  await settled;
+}
 
 /** A stand-in for RtcSession that repeats the sent outer envelope and segment in its ACK. */
 class FakeSession extends EventEmitter {
@@ -84,18 +105,15 @@ const camera = {
 function makeRouter(over: Partial<RtcCommandRouterDeps> = {}) {
   const sessions: FakeSession[] = [];
   const router = new RtcCommandRouter({
-    identity: () => ({ authToken: "tok", userId: "uid", accountUserId: "acct", gtoken: "g" }),
+    identity: () => ({ authToken: "tok", userId: "uid", gtoken: "g" }),
     shard: () => "ie-pr",
     country: "CH",
-    accountName: () => "Home Assistant",
     findDevice: (sn) => (sn === SN ? station : sn === CAMERA ? camera : undefined),
     createSession: (opts) => {
       const s = new FakeSession(opts);
       sessions.push(s);
       return s as unknown as RtcSession;
     },
-    ackTimeoutMs: 50,
-    connectTimeoutMs: 200,
     ...over,
   });
   return { router, sessions };
@@ -134,7 +152,7 @@ describe("RtcCommandRouter", () => {
     expect(sessions).toHaveLength(0);
   });
 
-  it("sends the app's 1350 envelope on the station channel with relay ICE and resolves on the ACK", async () => {
+  it("sends the app's 1350 envelope on the station channel and resolves on the ACK", async () => {
     const { router, sessions } = makeRouter();
     await router.dispatchCommand(SN, arming(1));
     expect(sessions).toHaveLength(1);
@@ -143,7 +161,6 @@ describe("RtcCommandRouter", () => {
     expect(s.opts.adminUserId).toBe("adminid");
     expect(s.opts.gtoken).toBe("g");
     expect(s.opts.shard).toBe("ie-pr");
-    expect(s.opts.peer?.icePolicy).toBe("relay");
     expect(s.sent).toHaveLength(1);
     const p = sent(s.sent[0]!);
     expect(p.commandId).toBe(PORTAL_CMD_SET_PAYLOAD);
@@ -261,48 +278,51 @@ describe("RtcCommandRouter", () => {
     { label: "null payload", payload: null },
     { label: "array payload", payload: [] },
     { label: "scalar payload", payload: 1 },
-  ])("does not complete a control command on $label", async (over) => {
-    const { router, sessions } = makeRouter({ ackTimeoutMs: 100 });
-    try {
-      await router.dispatchCommand(SN, arming(1));
-      const session = sessions[0]!;
-      session.behaviour = "silent";
-      const operation = router.dispatchCommand(CAMERA, {
-        kind: "set-json",
-        param: 6030,
-        data: { cmd_type: 1, rotate_type: 1, zoom: 1 },
-        channel: 2,
-      });
-      const assertion = expect(operation).rejects.toThrow("ACK timed out");
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      const header = sent(session.sent[1]!);
-      const cfg = {
-        segment: header.segment,
-        channel: 2,
-        param: 6030,
-        envelope: 1351,
-        link: 3,
-        response: 0,
-        payload: { limit: 0 },
-        ...over,
-      };
-      const body = Buffer.from(JSON.stringify({ cmd: cfg.param, payload: cfg.payload }));
-      session.emit(
-        "commandData",
-        Buffer.concat([buildPortalHeader(cfg.envelope, body.length, cfg.channel, cfg.segment, cfg.response), body]),
-        cfg.link,
-      );
-      await assertion;
-      expect(session.sent).toHaveLength(2);
-      expect(session.listenerCount("commandData")).toBe(0);
-      expect(session.closed).toBe(false);
-    } finally {
-      router.close();
-    }
-  });
+  ])("does not complete a control command on $label", (over) =>
+    onFakeTimers(async () => {
+      const { router, sessions } = makeRouter();
+      try {
+        await router.dispatchCommand(SN, arming(1));
+        const session = sessions[0]!;
+        session.behaviour = "silent";
+        const operation = router.dispatchCommand(CAMERA, {
+          kind: "set-json",
+          param: 6030,
+          data: { cmd_type: 1, rotate_type: 1, zoom: 1 },
+          channel: 2,
+        });
+        const assertion = expect(operation).rejects.toThrow("ACK timed out");
+        await vi.waitFor(() => expect(session.sent).toHaveLength(2));
+        const header = sent(session.sent[1]!);
+        const cfg = {
+          segment: header.segment,
+          channel: 2,
+          param: 6030,
+          envelope: 1351,
+          link: 3,
+          response: 0,
+          payload: { limit: 0 },
+          ...over,
+        };
+        const body = Buffer.from(JSON.stringify({ cmd: cfg.param, payload: cfg.payload }));
+        session.emit(
+          "commandData",
+          Buffer.concat([buildPortalHeader(cfg.envelope, body.length, cfg.channel, cfg.segment, cfg.response), body]),
+          cfg.link,
+        );
+        await vi.advanceTimersByTimeAsync(ACK_TIMEOUT_MS);
+        await assertion;
+        expect(session.sent).toHaveLength(2);
+        expect(session.listenerCount("commandData")).toBe(0);
+        expect(session.closed).toBe(false);
+      } finally {
+        router.close();
+      }
+    }),
+  );
 
   it("requires a command-link ACK with the matching outer envelope and segment without replay", async () => {
-    const { router, sessions } = makeRouter({ ackTimeoutMs: 500 });
+    const { router, sessions } = makeRouter();
     try {
       await router.dispatchCommand(SN, arming(1));
       const session = sessions[0]!;
@@ -340,27 +360,28 @@ describe("RtcCommandRouter", () => {
     const { router, sessions } = makeRouter();
     await router.dispatchCommand(SN, arming(1));
     sessions[0]!.behaviour = "silent";
-    await expect(router.dispatchCommand(SN, arming(2))).rejects.toThrow(/ACK timed out/);
+    await onFakeTimers(() => rejectsAfter(router.dispatchCommand(SN, arming(2)), /ACK timed out/, ACK_TIMEOUT_MS));
     const { router: r2, sessions: s2 } = makeRouter();
     await r2.dispatchCommand(SN, arming(1));
     s2[0]!.behaviour = "close";
     await expect(r2.dispatchCommand(SN, arming(2))).rejects.toThrow(/session closed/);
   });
 
-  it("does not let a late ACK for a timed-out command complete the next one", async () => {
-    const { router, sessions } = makeRouter();
-    await router.dispatchCommand(SN, arming(1));
-    const s = sessions[0]!;
-    s.behaviour = "silent";
-    await expect(router.dispatchCommand(SN, arming(2))).rejects.toThrow(/ACK timed out/);
-    const timedOut = sent(s.sent[1]!).segment;
-    // B is in flight on the same session when A's ACK finally arrives: B must NOT resolve on it.
-    const b = router.dispatchCommand(SN, arming(3));
-    await new Promise((r) => setTimeout(r, 5));
-    s.ackSegment(timedOut);
-    await expect(b).rejects.toThrow(/ACK timed out/);
-    expect(s.sent).toHaveLength(3); // nothing was replayed
-  });
+  it("does not let a late ACK for a timed-out command complete the next one", () =>
+    onFakeTimers(async () => {
+      const { router, sessions } = makeRouter();
+      await router.dispatchCommand(SN, arming(1));
+      const s = sessions[0]!;
+      s.behaviour = "silent";
+      await rejectsAfter(router.dispatchCommand(SN, arming(2)), /ACK timed out/, ACK_TIMEOUT_MS);
+      const timedOut = sent(s.sent[1]!).segment;
+      // B is in flight on the same session when A's ACK finally arrives: B must NOT resolve on it.
+      const b = router.dispatchCommand(SN, arming(3));
+      await vi.waitFor(() => expect(s.sent).toHaveLength(3));
+      s.ackSegment(timedOut);
+      await rejectsAfter(b, /ACK timed out/, ACK_TIMEOUT_MS);
+      expect(s.sent).toHaveLength(3); // nothing was replayed
+    }));
 
   it("fails the bring-up once, with the session closed, when connect() throws or never comes up", async () => {
     FakeSession.connectMode = "throw";
@@ -369,13 +390,14 @@ describe("RtcCommandRouter", () => {
       await expect(router.dispatchCommand(SN, arming(1))).rejects.toThrow(/sign refused/);
       expect(sessions[0]!.closed).toBe(true);
       FakeSession.connectMode = "never";
-      const { router: r2, sessions: s2 } = makeRouter({ connectTimeoutMs: 30 });
-      await expect(r2.dispatchCommand(SN, arming(1))).rejects.toThrow(/did not come up within 30ms/);
+      const { router: r2, sessions: s2 } = makeRouter();
+      const late = new RegExp(`did not come up within ${CONNECT_TIMEOUT_MS}ms`);
+      await onFakeTimers(() => rejectsAfter(r2.dispatchCommand(SN, arming(1)), late, CONNECT_TIMEOUT_MS));
       expect(s2[0]!.closed).toBe(true);
       // connect() that never settles at all: the bounded bring-up's deadline still fires and closes it
       FakeSession.connectMode = "hang";
-      const { router: r3, sessions: s3 } = makeRouter({ connectTimeoutMs: 30 });
-      await expect(r3.dispatchCommand(SN, arming(1))).rejects.toThrow(/did not come up within 30ms/);
+      const { router: r3, sessions: s3 } = makeRouter();
+      await onFakeTimers(() => rejectsAfter(r3.dispatchCommand(SN, arming(1)), late, CONNECT_TIMEOUT_MS));
       expect(s3[0]!.closed).toBe(true);
       // the deadline has passed and the session is gone: a retry opens a fresh one instead of reusing it
       FakeSession.connectMode = "up";

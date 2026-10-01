@@ -1,8 +1,8 @@
 /**
  * The T9000's signalling does not carry SDP text: an `info` message carries a small JSON — DTLS setup
  * role, ICE ufrag/pwd, fingerprint and candidates — and each side rebuilds the one-m-line SDP from it.
- * This is the portal's own translation (security.eufy.com), reproduced so what we hand libdatachannel
- * is the SDP the hub meant, and what we send back is the JSON the hub parses.
+ * This is the portal's own translation (security.eufy.com): the SDP handed to the native peer is the one
+ * the hub meant, and the JSON sent back is the one the hub parses.
  */
 
 export interface ScallSdpJson {
@@ -18,10 +18,13 @@ export interface ScallSdpJson {
 
 /** The hub's SDP is one SCTP application m-line bundled under mid 2, as the portal template has it. */
 export const HUB_SDP_MID = "2";
-/** The hub advertises this max message size and libdatachannel must be told the same. */
+/** The max message size the hub advertises; the answer carries the same. */
 export const ANKER_MAX_MESSAGE_SIZE = 262144;
 
-/** Rebuild the hub's offer (or answer) SDP from its scall JSON. */
+/**
+ * Rebuild the hub's offer (or answer) SDP from its scall JSON. The JSON carries the fingerprint as bare
+ * hex; the SDP gets colon-separated byte pairs.
+ */
 export function scallJsonToSdp(json: ScallSdpJson, now: () => number = Date.now): string {
   let sdp = "";
   sdp += "v=0\r\n";
@@ -37,7 +40,6 @@ export function scallJsonToSdp(json: ScallSdpJson, now: () => number = Date.now)
   if (json.ice?.ufrag) sdp += `a=ice-ufrag:${json.ice.ufrag}\r\n`;
   if (json.ice?.pwd) sdp += `a=ice-pwd:${json.ice.pwd}\r\n`;
   if (json.ice?.fingerprint) {
-    // The JSON carries the fingerprint as bare hex; SDP wants colon-separated byte pairs.
     const fp = json.ice.fingerprint.replace(/(.{2})(?=.)/g, "$1:");
     sdp += `a=fingerprint:${json.ice.fingerprint_type ?? "sha-256"} ${fp}\r\n`;
   }
@@ -76,26 +78,15 @@ export function iceCandidateType(candidate: string): string {
   return candidate.match(/typ (\w+)/)?.[1] ?? "unknown";
 }
 
-/** Drop every candidate line whose type isn't `host` — the LAN-only ICE policy. */
-export function keepHostCandidates(sdp: string): string {
-  const eol = sdp.includes("\r\n") ? "\r\n" : "\n";
-  const kept = sdp
-    .split(/\r?\n/)
-    .filter((line) => !line.startsWith("a=candidate:") || iceCandidateType(line) === "host");
-  return kept.join(eol) + (kept.length > 0 && kept[kept.length - 1] !== "" ? eol : "");
-}
-
 /** Pin `a=max-message-size` to what the hub advertises, whatever libdatachannel wrote. */
 export function pinMaxMessageSize(sdp: string): string {
   return sdp.replace(/a=max-message-size:\d+/g, `a=max-message-size:${ANKER_MAX_MESSAGE_SIZE}`);
 }
 
 /**
- * Force a concrete DTLS role into an SDP. The hub offers `actpass`, leaving the choice to us — and the
- * choice is not free: RFC 8832 gives the DTLS **client** the even SCTP stream ids and the **server**
- * the odd ones, while the portal (and this client) open their data channels on odd ids 1/3/5/7/9/11.
- * Answering `active` would make us the client using server ids, so the channels open locally and the
- * hub never sees them — the session comes up and then nothing ever arrives.
+ * Force a concrete DTLS role into an SDP. The hub offers `actpass`; the peer pins that offer to
+ * `passive`, which leaves one legal answer, `active`. The DTLS client opens its data channels on the
+ * even SCTP stream ids (RFC 8832), and the hub pairs with those: its command channel is stream 0.
  */
 export function forceDtlsRole(sdp: string, role: "active" | "passive"): string {
   if (/a=setup:(active|passive|actpass)/.test(sdp))
@@ -104,13 +95,8 @@ export function forceDtlsRole(sdp: string, role: "active" | "passive"): string {
 }
 
 /**
- * The wire form of a trickled ICE candidate: `candidate:...`, the shape the hub itself sends.
- *
- * libdatachannel hands out the SDP attribute line (`a=candidate:...`), and the portal protocol carries
- * the attribute's VALUE — the hub's own `info` messages arrive as `candidate:1 1 udp … typ host`, and
- * the candidate array inside a scall body drops the `candidate:` too. Sending the raw `a=` line makes
- * every trickled candidate unparseable to the hub; a session survives it only because the scall body
- * already carried the gathered set.
+ * The wire form of a trickled ICE candidate: `candidate:...`, the attribute's value, which is the shape
+ * the hub sends and parses. The native peer hands out the SDP attribute line (`a=candidate:...`).
  */
 export function toWireCandidate(candidate: string): string {
   return candidate.trim().replace(/^a=/, "");
