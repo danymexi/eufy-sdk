@@ -26,7 +26,7 @@
  * No forward-error-correction packets were ever emitted (the module's FEC group setting changed
  * nothing), and a frame with one packet missing never reassembles — so the receiver here does the same:
  * it completes a frame only when every index up to the `last` one is present and their lengths add up.
- * Frames whose packets stop arriving are dropped after `staleMs`.
+ * Incomplete frames are subject to both idle and absolute expiry, as well as receive resource limits.
  */
 
 import { isPortalPacket, PortalLinkType } from "./portal-packet.js";
@@ -126,67 +126,165 @@ export function packetize(
 
 interface Partial {
   channel: number;
+  sequence: number;
   frameLength: number;
   chunks: Map<number, Buffer>;
+  bytes: number;
+  maxIndex: number;
   lastIndex?: number;
+  created: number;
   touched: number;
 }
 
-/** Reassemble frames from wire packets, in any order, one frame at a time per (channel, id). */
+/** Receive resource policy; these limits are not claims about device frame sizes. */
+export interface PtcsReassemblerOptions {
+  /** Maximum declared size of one frame, in bytes. Defaults to 8 MiB. */
+  maxFrameBytes?: number;
+  /** Maximum number of incomplete frames. Defaults to 32. */
+  maxPendingFrames?: number;
+  /** Maximum retained fragment payload across all incomplete frames. Defaults to 16 MiB. */
+  maxBufferedBytes?: number;
+  /** Maximum number of fragment positions in one frame. Defaults to 16,384. */
+  maxFragmentsPerFrame?: number;
+  /** Absolute assembly lifetime in milliseconds, regardless of progress. Defaults to 15,000. */
+  maxAgeMs?: number;
+  /** Idle lifetime in milliseconds; duplicates do not count as progress. Defaults to 15,000. */
+  staleMs?: number;
+  now?: () => number;
+}
+
+/**
+ * Bounded, out-of-order assembly per (channel, id). Identical duplicates are ignored; conflicting
+ * metadata or fragments discard the affected assembly. Capacity rejects new frames without evicting
+ * existing ones. Exceeding the payload budget discards the assembly receiving that fragment.
+ */
 export class PtcsReassembler {
   private readonly partials = new Map<string, Partial>();
+  private readonly limits: Required<Omit<PtcsReassemblerOptions, "now">>;
+  private readonly now: () => number;
+  private retainedBytes = 0;
 
   constructor(
     private readonly onFrame: (frame: Buffer, channel: number) => void,
-    private readonly opts: { staleMs?: number; now?: () => number } = {},
-  ) {}
+    opts: PtcsReassemblerOptions = {},
+  ) {
+    this.now = opts.now ?? Date.now;
+    this.limits = {
+      maxFrameBytes: opts.maxFrameBytes ?? 8 * 1024 * 1024,
+      maxPendingFrames: opts.maxPendingFrames ?? 32,
+      maxBufferedBytes: opts.maxBufferedBytes ?? 16 * 1024 * 1024,
+      maxFragmentsPerFrame: opts.maxFragmentsPerFrame ?? 16_384,
+      maxAgeMs: opts.maxAgeMs ?? 15_000,
+      staleMs: opts.staleMs ?? 15_000,
+    };
+    for (const [name, value] of Object.entries(this.limits)) {
+      if (!Number.isSafeInteger(value) || value <= 0)
+        throw new RangeError(`PTCS ${name} must be a positive safe integer`);
+    }
+    if (this.limits.maxFragmentsPerFrame > 65_536) throw new RangeError("PTCS fragment limit exceeds the index range");
+  }
 
   push(packet: Buffer): boolean {
     const h = parsePtcsHeader(packet);
     if (!h) return false;
-    const body = packet.subarray(PTCS_HEADER_LENGTH, PTCS_HEADER_LENGTH + h.payloadLength);
-    if (body.length !== h.payloadLength) return false;
+    const now = this.now();
+    this.expireAt(now);
     const key = `${h.channel}:${h.frameId}`;
-    const now = (this.opts.now ?? Date.now)();
+    const body = packet.subarray(PTCS_HEADER_LENGTH, PTCS_HEADER_LENGTH + h.payloadLength);
+    if (
+      body.length !== h.payloadLength ||
+      h.frameLength > this.limits.maxFrameBytes ||
+      h.index >= this.limits.maxFragmentsPerFrame ||
+      (h.frameLength === 0
+        ? h.index !== 0 || !h.last || body.length !== 0
+        : body.length === 0 || h.index >= h.frameLength)
+    ) {
+      this.drop(key);
+      return false;
+    }
     let p = this.partials.get(key);
+    if (
+      p &&
+      (p.frameLength !== h.frameLength ||
+        p.sequence !== h.sequence ||
+        (p.lastIndex !== undefined && (h.index > p.lastIndex || (h.last && h.index !== p.lastIndex))) ||
+        (h.last && h.index < p.maxIndex))
+    ) {
+      this.drop(key);
+      return false;
+    }
+    const previous = p?.chunks.get(h.index);
+    if (previous) {
+      if (previous.equals(body) && h.last === (p!.lastIndex === h.index)) return true;
+      this.drop(key);
+      return false;
+    }
+    if (
+      (p?.bytes ?? 0) + body.length > h.frameLength ||
+      this.retainedBytes + body.length > this.limits.maxBufferedBytes
+    ) {
+      this.drop(key);
+      return false;
+    }
     if (!p) {
-      p = { channel: h.channel, frameLength: h.frameLength, chunks: new Map(), touched: now };
+      if (this.partials.size >= this.limits.maxPendingFrames) return false;
+      p = {
+        channel: h.channel,
+        sequence: h.sequence,
+        frameLength: h.frameLength,
+        chunks: new Map(),
+        bytes: 0,
+        maxIndex: h.index,
+        created: now,
+        touched: now,
+      };
       this.partials.set(key, p);
     }
     p.touched = now;
+    p.maxIndex = Math.max(p.maxIndex, h.index);
     p.chunks.set(h.index, Buffer.from(body));
+    p.bytes += body.length;
+    this.retainedBytes += body.length;
     if (h.last) p.lastIndex = h.index;
-    if (p.lastIndex === undefined) return true;
-    let total = 0;
+    if (p.lastIndex === undefined || p.chunks.size !== p.lastIndex + 1) return true;
+    this.drop(key);
+    if (p.bytes !== p.frameLength) return false;
     const parts: Buffer[] = [];
-    for (let i = 0; i <= p.lastIndex; i++) {
-      const c = p.chunks.get(i);
-      if (!c) return true;
-      parts.push(c);
-      total += c.length;
-    }
-    this.partials.delete(key);
-    if (total !== p.frameLength) return false;
-    this.onFrame(Buffer.concat(parts, total), p.channel);
+    for (let i = 0; i <= p.lastIndex; i++) parts.push(p.chunks.get(i)!);
+    this.onFrame(Buffer.concat(parts, p.bytes), p.channel);
     return true;
   }
 
-  /** Drop frames that stopped arriving; call periodically. */
+  /** Drop frames at their idle or absolute deadline. Also performed before admitting a packet. */
   expire(): number {
-    const staleMs = this.opts.staleMs ?? 15_000;
-    const now = (this.opts.now ?? Date.now)();
+    return this.expireAt(this.now());
+  }
+
+  private expireAt(now: number): number {
     let dropped = 0;
     for (const [key, p] of this.partials) {
-      if (now - p.touched > staleMs) {
-        this.partials.delete(key);
+      if (now - p.touched >= this.limits.staleMs || now - p.created >= this.limits.maxAgeMs) {
+        this.drop(key);
         dropped++;
       }
     }
     return dropped;
   }
 
+  private drop(key: string): void {
+    const p = this.partials.get(key);
+    if (!p) return;
+    this.retainedBytes -= p.bytes;
+    this.partials.delete(key);
+  }
+
   get pending(): number {
     return this.partials.size;
+  }
+
+  /** Retained fragment payload bytes, excluding metadata and delivered frames. */
+  get bufferedBytes(): number {
+    return this.retainedBytes;
   }
 }
 
@@ -201,13 +299,11 @@ export function frameIdClock(now: () => number = Date.now): () => number {
   };
 }
 
-export interface PtcsFramerOptions {
+export interface PtcsFramerOptions extends PtcsReassemblerOptions {
   payloadBytes?: number;
   /** Where the frame counter starts; the portal's was mid-run when it was observed. */
   sequence?: number;
-  staleMs?: number;
   nextFrameId?: () => number;
-  now?: () => number;
 }
 
 /** The {@link PortalFramer} the session uses: PTCS out, PTCS in, with the portal's channel mapping. */
@@ -231,10 +327,10 @@ export class PtcsFramer implements PortalFramer {
   ): Promise<void> {
     this.onWire = onWirePacket;
     this.onFrame = onFrame;
-    this.reassembler = new PtcsReassembler((frame, channel) => this.onFrame?.(frame, linkTypeForChannel(channel)), {
-      staleMs: this.opts.staleMs,
-      now: this.opts.now,
-    });
+    this.reassembler = new PtcsReassembler(
+      (frame, channel) => this.onFrame?.(frame, linkTypeForChannel(channel)),
+      this.opts,
+    );
     this.sweep = setInterval(() => this.reassembler?.expire(), 1_000);
     this.sweep.unref?.();
     this.ready = true;
