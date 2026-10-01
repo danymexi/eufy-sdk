@@ -1,25 +1,22 @@
 /**
- * The WebRTC peer for a T9000 session — libdatachannel through `node-datachannel`, driven the way the
+ * The WebRTC peer for a T9000 session: libdatachannel through `node-datachannel`, driven the way the
  * portal drives a browser's RTCPeerConnection.
  *
- * The hub is the offerer: it sends its SDP once it has granted the session, we answer. Six data channels
- * are declared in the portal's order (`WebrtcDataChannel` first — the command channel — then audio, idr,
- * video, notify, download). Every one of them carries PTCS-framed portal packets; which logical channel
- * a reassembled frame belongs to is the PTCS header's channel (command / notify / live / …), not the
- * data channel it rode on, and the portal's own receiver reads it the same way.
+ * The hub is the offerer: it sends its SDP once it has granted the session, and the peer answers. Six
+ * data channels are declared in the portal's order (`WebrtcDataChannel` first, the command channel,
+ * then audio, idr, video, notify, download). Every one carries PTCS-framed portal packets; which logical
+ * channel a reassembled frame belongs to is the PTCS header's channel, not the data channel it rode on.
  *
- * ICE on a LAN is deliberately **host-only** by default. The hub offers a TURN relay and a
- * server-reflexive candidate too, and both pass STUN checks — so ICE may nominate one — yet neither
- * completes DTLS on current firmware: if one wins the race the handshake stalls ~31 s and drops. Keeping
- * only host candidates on both sides settles ICE on the direct LAN pair every time, which is also what
- * the phone does on the same network (captured: ICE straight to the station's LAN address).
+ * ICE is relay-only. The hub grants a TURN allocation in its `scall 100` reply and completes DTLS only
+ * over the relay pair; on a host pair ICE connects and the DTLS handshake never completes. The peer
+ * plays the DTLS client (`active`) and opens its channels on the client's even SCTP stream ids, which
+ * is what the hub pairs with.
  *
- * The native peer is injectable so the state machine is testable without a network.
+ * The native peer is injectable.
  */
 
 import { EventEmitter } from "node:events";
 import { noopLogger, type Logger } from "../../core/logger.js";
-import type { PortalFramer, PortalFramerFactory } from "./framer.js";
 import { PortalLinkType } from "./portal-packet.js";
 import { PtcsFramer } from "./ptcs-framer.js";
 import {
@@ -27,12 +24,9 @@ import {
   HUB_SDP_MID,
   forceDtlsRole,
   iceCandidateType,
-  keepHostCandidates,
   pinMaxMessageSize,
   sdpToScallJson,
 } from "./scall-sdp.js";
-
-export type IcePolicy = "host-only" | "all" | "relay";
 
 export interface TurnConfig {
   turn_addr: string;
@@ -82,35 +76,13 @@ export interface NativePeerConfig {
   iceTransportPolicy: "all" | "relay";
   maxMessageSize: number;
   enableIceTcp: boolean;
-  bindAddress?: string;
 }
 
 export type NativePeerFactory = (name: string, config: NativePeerConfig) => NativePeerConnection;
 
 export interface RtcPeerOptions {
-  icePolicy?: IcePolicy;
-  /** Local interface to bind; helps a multi-homed host pick the LAN the hub is on. */
-  bindAddress?: string;
   createPeer?: NativePeerFactory;
-  createFramer?: PortalFramerFactory;
   logger?: Logger;
-  /** How long to wait for libdatachannel to produce the local answer. */
-  answerTimeoutMs?: number;
-  /**
-   * Pin OUR DTLS role, by pinning the complement into the hub's offer before it is applied — the role
-   * has to be fixed where it is DECIDED, since rewriting our own answer changes only what we announce
-   * and deadlocks the handshake.
-   *
-   * Defaults to `active`, which is what the portal plays: left to itself libdatachannel answers
-   * `passive`, taking the odd stream ids while the hub is paired with the even ones. Pass `undefined`
-   * to leave the hub's `actpass` alone and let libdatachannel choose.
-   */
-  dtlsRole?: "active" | "passive";
-  /**
-   * How to assign SCTP stream ids: `portal` (default) pins the portal's odd ids, which match the DTLS
-   * server role libdatachannel takes; `auto` leaves the choice to libdatachannel.
-   */
-  dataChannelIds?: "auto" | "portal";
 }
 
 export interface RtcPeerEvents {
@@ -144,11 +116,8 @@ export function labelForLinkType(linkType: number): string {
   }
 }
 /**
- * SCTP stream ids the portal assigns, read off its own live session: its `WebrtcDataChannel` is id
- * **0**, and the rest follow in channel order. Even ids are the DTLS **client**'s half under RFC 8832,
- * which says what the portal is — and therefore what we have to be, since the hub pairs with one side
- * of that split and ignores channels opened on the other. Hence the `active` default in
- * {@link RtcPeerOptions.dtlsRole}: the two are one decision, not two.
+ * The SCTP stream ids the portal assigns: `WebrtcDataChannel` is id 0 and the rest follow in channel
+ * order. Even ids are the DTLS client's half under RFC 8832, which is why the peer answers `active`.
  */
 const DATA_CHANNEL_IDS: Record<string, number> = {
   WebrtcDataChannel: 0,
@@ -169,12 +138,12 @@ function turnServers(turn: TurnConfig): NativeIceServer[] {
   return servers;
 }
 
+/**
+ * `node-datachannel` is an optional dependency: only a T9000 station needs the WebRTC transport. It is
+ * loaded on the first session, and a missing module fails with an install hint rather than a bare
+ * module-not-found.
+ */
 async function loadNativePeerFactory(): Promise<NativePeerFactory> {
-  // `node-datachannel` is an OPTIONAL dependency: only a T9000 (S1 Pro) station needs the WebRTC
-  // transport. It still installs by default (npm installs optionalDependencies; a consumer opts out
-  // with `--omit=optional`, and a failed install of it doesn't fail the overall install). What this
-  // dynamic import buys is deferring the native addon's *load* until a T9000 is actually driven, with
-  // a clear message if it is absent rather than a bare module-not-found.
   let ndc: typeof import("node-datachannel");
   try {
     ndc = await import("node-datachannel");
@@ -188,10 +157,13 @@ async function loadNativePeerFactory(): Promise<NativePeerFactory> {
   return (name, config) => new ndc.PeerConnection(name, config as never) as unknown as NativePeerConnection;
 }
 
+/** How long the native peer has to produce the local answer. */
+const ANSWER_TIMEOUT_MS = 15_000;
+
 export class RtcPeer extends EventEmitter<RtcPeerEvents> {
   private pc?: NativePeerConnection;
   private readonly channels = new Map<string, NativeDataChannel>();
-  private framer?: PortalFramer;
+  private framer?: PtcsFramer;
   private readonly wireTally = new Map<string, number>();
   private framerInit?: Promise<void>;
   private commandOpen = false;
@@ -203,28 +175,23 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
   private wireSendFailed = false;
   private readonly pending: string[] = [];
   private localAnswer?: { resolve: (sdp: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
-  private readonly icePolicy: IcePolicy;
   private readonly logger: Logger;
-  private readonly createFramer: PortalFramerFactory;
 
   constructor(private readonly opts: RtcPeerOptions = {}) {
     super();
-    this.icePolicy = opts.icePolicy ?? "host-only";
     this.logger = opts.logger ?? noopLogger;
-    this.createFramer = opts.createFramer ?? (() => new PtcsFramer());
   }
 
-  /** Create the native peer. `turn` is what the hub granted in `scall 100`; unused under `host-only`. */
-  async init(turn?: TurnConfig): Promise<void> {
+  /** Create the native peer on the relay the hub granted in `scall 100`. */
+  async init(turn: TurnConfig): Promise<void> {
     if (this.pc) return;
     const createPeer = this.opts.createPeer ?? (await loadNativePeerFactory());
     const config: NativePeerConfig = {
-      iceServers: this.icePolicy === "host-only" || !turn ? [] : turnServers(turn),
-      iceTransportPolicy: this.icePolicy === "relay" ? "relay" : "all",
+      iceServers: turnServers(turn),
+      iceTransportPolicy: "relay",
       maxMessageSize: ANKER_MAX_MESSAGE_SIZE,
       enableIceTcp: true,
     };
-    if (this.opts.bindAddress) config.bindAddress = this.opts.bindAddress;
     const pc = createPeer("eufy-sdk", config);
     this.pc = pc;
     pc.onLocalDescription((sdp, type) => {
@@ -252,42 +219,33 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     pc.onDataChannel((dc) => this.wireChannel(dc.getLabel(), dc));
   }
 
-  /** The hub offered: declare our channels, apply the offer, return the answer SDP to signal back. */
+  /**
+   * The hub offered: apply the offer, declare the channels, return the answer SDP to signal back.
+   *
+   * The offer is pinned to `passive` before it is applied, so the native peer has one legal answer,
+   * `active`: the role is fixed where it is decided, since rewriting the answer afterwards would change
+   * only what is announced. The offer goes in before the channels are declared: `createDataChannel` on
+   * a peer without a remote description starts its own negotiation and leaves it in `have-local-offer`.
+   * The data channels need no m-line of their own; the offer's SCTP m-line carries them. Only an ANSWER
+   * is taken as the local description: one read in `have-local-offer` is an offer.
+   */
   async handleRemoteOffer(offerSdp: string): Promise<string> {
     const pc = this.pc;
     if (!pc) throw new Error("RTC peer not initialised");
     if (this.handlingOffer) throw new Error("RTC peer already handling an offer");
     this.handlingOffer = true;
     try {
-      let offer = this.icePolicy === "host-only" ? keepHostCandidates(offerSdp) : offerSdp;
-      // Choosing our DTLS role means editing the role in the HUB's offer, not in our answer. The hub
-      // offers `actpass` and leaves the choice to libdatachannel; rewriting our answer afterwards only
-      // changes what we ANNOUNCE, never the role libdatachannel plays, which deadlocks the handshake.
-      // Pinning the offer to one concrete role leaves libdatachannel exactly one legal answer — the
-      // complement — so what we announce and what we do are the same thing.
-      const dtlsRole = "dtlsRole" in this.opts ? this.opts.dtlsRole : "active";
-      if (dtlsRole) offer = forceDtlsRole(offer, dtlsRole === "passive" ? "active" : "passive");
+      const offer = forceDtlsRole(offerSdp, "passive");
       const answerWait = new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
           this.localAnswer = undefined;
           reject(new Error("timed out waiting for the local SDP answer"));
-        }, this.opts.answerTimeoutMs ?? 15_000);
+        }, ANSWER_TIMEOUT_MS);
         this.localAnswer = { resolve, reject, timer };
       });
-      // The hub's offer goes in FIRST, and the channels are declared onto the answer it puts us in.
-      // Creating them first is what a reader expects — the answer should describe them — but
-      // `createDataChannel` makes libdatachannel negotiate on its own: it fires `negotiationNeeded` and
-      // produces a local OFFER, leaving the peer in `have-local-offer` when the hub's offer arrives.
-      // Whoever won that race decided the session, and the losing side shipped our offer as the answer:
-      // the hub then ran its connectivity checks against an ICE ufrag/pwd nobody was listening on, so
-      // ICE failed with a textbook-looking signalling log. Data channels need no m-line of their own —
-      // the offer already carries the SCTP one — so declaring them after costs nothing.
       pc.setRemoteDescription(offer, "offer");
       this.remoteSet = true;
       this.createChannels();
-      // Only an ANSWER counts. `localDescription()` also answers while the peer sits in
-      // `have-local-offer`, and taking that would ship the offer as the answer — the same failure by a
-      // shorter path.
       const local = pc.localDescription();
       let answer = String(local?.type ?? "").toLowerCase() === "answer" ? (local?.sdp ?? "") : "";
       if (!answer) answer = await answerWait;
@@ -324,19 +282,8 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
 
   /**
    * Send one portal packet on the command channel, through the framer. False when the channel is not
-   * usable OR the native send refused a wire packet — a dropped frame must not read as success.
+   * usable or the native send refused a wire packet, so a dropped frame does not read as success.
    */
-  /**
-   * Send bytes on the command channel AS THEY ARE — no PTCS framing. The portal's data-channel keepalive
-   * (a 20-byte prefix + a bare `XZYH 1139`, every ~29 s, echoed by the hub) rides the wire unframed, and the
-   * framer would wrap it. False when the channel isn't open.
-   */
-  sendRaw(bytes: Buffer): boolean {
-    const dc = this.channels.get(COMMAND_CHANNEL);
-    if (!dc?.isOpen()) return false;
-    return dc.sendMessageBinary(bytes);
-  }
-
   sendCommand(portalPacket: Buffer): boolean {
     const dc = this.channels.get(COMMAND_CHANNEL);
     if (!dc?.isOpen() || !this.commandOpen || !this.framer?.isReady()) return false;
@@ -350,12 +297,12 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     return !this.wireSendFailed;
   }
 
+  /** Tear the peer down. A pending answer is rejected, so a `handleRemoteOffer` in flight settles. */
   close(): void {
     this.framer?.destroy();
     this.framer = undefined;
     this.framerInit = undefined;
     if (this.localAnswer) {
-      // Reject rather than drop: handleRemoteOffer is awaiting this, and a silent drop hangs it.
       clearTimeout(this.localAnswer.timer);
       const pending = this.localAnswer;
       this.localAnswer = undefined;
@@ -372,18 +319,14 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
   }
 
   private acceptsCandidate(candidate: string): boolean {
-    const type = iceCandidateType(candidate);
-    if (this.icePolicy === "host-only") return type === "host";
-    if (this.icePolicy === "relay") return type === "relay";
-    return true;
+    return iceCandidateType(candidate) === "relay";
   }
 
   private createChannels(): void {
     if (!this.pc || this.channelsCreated) return;
     this.channelsCreated = true;
     for (const label of DATA_CHANNEL_LABELS) {
-      const pinned = this.opts.dataChannelIds === "auto" ? undefined : DATA_CHANNEL_IDS[label];
-      const dc = this.pc.createDataChannel(label, { id: pinned, unordered: false });
+      const dc = this.pc.createDataChannel(label, { id: DATA_CHANNEL_IDS[label], unordered: false });
       this.wireChannel(label, dc);
     }
   }
@@ -408,7 +351,6 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     dc.onClosed(() => {
       this.logger.debug(`[rtc] data channel closed ${label}`);
       if (label !== COMMAND_CHANNEL) return;
-      // The command path is the session: announce it so a caller stops believing it is connected.
       const wasOpen = this.commandOpen;
       this.commandOpen = false;
       if (wasOpen) this.emit("commandChannelClosed");
@@ -416,7 +358,6 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     dc.onError((err) => this.emit("error", new Error(`RTC data channel ${label}: ${err}`)));
     dc.onMessage((msg) => {
       const buf = typeof msg === "string" ? Buffer.from(msg) : Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-      // Per-channel wire tally (debug): the first packets of each label, then one line per 100.
       const n = (this.wireTally.get(label) ?? 0) + 1;
       this.wireTally.set(label, n);
       if (n <= 3 || n % 100 === 0) {
@@ -426,14 +367,13 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
         this.framer.recvPacket(buf);
         return;
       }
-      // Before the framer is up (the command channel not open yet) nothing can be reassembled.
       this.emit("data", label, buf, 0);
     });
   }
 
   private initFramer(dc: NativeDataChannel): Promise<void> {
     if (this.framerInit) return this.framerInit;
-    const framer = this.createFramer();
+    const framer = new PtcsFramer();
     this.framer = framer;
     this.framerInit = framer
       .init(

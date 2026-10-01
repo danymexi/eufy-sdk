@@ -68,12 +68,6 @@ export interface MegaClientConfig {
    * against the account.
    */
   accountName?: string;
-  /**
-   * The mega shard the RTC (T9000) signalling signs on, e.g. `"ie-pr"`. Defaults to the regional
-   * prefix of the `estimate_domain` host (`security-app-ie…` → `ie-pr`), then to {@link regionShard}.
-   * Set it when the account lives on a shard the eu/us classification cannot name.
-   */
-  rtcShard?: string;
   /** Persist + reuse the session (token + session key) across runs. Default: in-memory. */
   store?: SessionStore;
   /** Diagnostics sink. Omit for silence; pass a `Logger` (or `new ConsoleLogger()`) to see logs. */
@@ -336,7 +330,7 @@ export interface SignedRetry {
 export class MegaHttpClient {
   private readonly cfg: Required<Pick<MegaClientConfig, "appName" | "appVersion" | "countryCode">> & MegaClientConfig;
   private region: RegionShard;
-  /** The host `estimate_domain` answered, kept for the RTC shard derivation. */
+  /** The host `estimate_domain` answered, persisted with the session. */
   private estimatedDomain = "";
   private bootstrapDomain?: string;
   private sessionKey?: SessionEntry;
@@ -428,6 +422,7 @@ export class MegaHttpClient {
     const saved = this.store.load();
     if (!isSessionValid(saved) || !saved) return undefined;
     this.region = saved.region;
+    this.estimatedDomain = saved.estimatedDomain ?? "";
     this.auth_ = {
       userId: saved.userId,
       accountUserId: saved.accountUserId,
@@ -456,30 +451,22 @@ export class MegaHttpClient {
   }
 
   /**
-   * The shard the RTC signalling (T9000 control channel) signs on — {@link MegaClientConfig.rtcShard}
-   * when pinned, else the regional prefix of the estimated domain (`…-ie-…`/`…-ie.` → `ie-pr`), else
-   * {@link regionShard}. The eu/us classification cannot name shards like `ie-pr`, whose accounts
-   * need the IE sign host and cluster.
+   * The shard the RTC signalling signs on: the regional prefix of the estimated domain
+   * (`…-ie-…`/`…-ie.` → `ie-pr`), else {@link regionShard}. The eu/us classification cannot name shards
+   * like `ie-pr`, whose accounts need the IE sign host and cluster.
    */
   get rtcShard(): string {
-    const pinned = this.cfg.rtcShard?.trim();
-    if (pinned) return pinned;
     const m = /-([a-z]{2})(?:[.-]|$)/i.exec(this.estimatedDomain);
-    if (m) return `${m[1].toLowerCase()}-pr`;
-    return this.region;
+    return m ? `${m[1].toLowerCase()}-pr` : this.region;
   }
 
-  /** The credentials the RTC signalling needs; `undefined` while logged out. */
-  rtcIdentity(): { authToken: string; userId: string; accountUserId?: string; gtoken: string } | undefined {
+  /**
+   * The credentials the RTC signalling needs; `undefined` while logged out. The sign is refused
+   * ("gtoken not equal userid") unless its gtoken is the one every authed HTTP call carries.
+   */
+  rtcIdentity(): { authToken: string; userId: string; gtoken: string } | undefined {
     if (!this.auth_) return undefined;
-    // The same gtoken every authed HTTP call carries — the signalling sign is refused with
-    // "gtoken not equal userid" when it is derived from any other id.
-    return {
-      authToken: this.auth_.authToken,
-      userId: this.auth_.userId,
-      accountUserId: this.auth_.accountUserId,
-      gtoken: gtoken(this.gtokenUserId()),
-    };
+    return { authToken: this.auth_.authToken, userId: this.auth_.userId, gtoken: gtoken(this.gtokenUserId()) };
   }
 
   /**
@@ -1374,6 +1361,7 @@ export class MegaHttpClient {
       authToken: this.auth_.authToken,
       geoKey: this.auth_.geoKey,
       region: this.region,
+      estimatedDomain: this.estimatedDomain,
       openudid: this.openudid,
       phoneModel: this.phoneModel,
       mediaUserAgent: this.mediaUserAgent,

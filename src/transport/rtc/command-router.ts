@@ -1,85 +1,64 @@
 /**
- * RTC command router — drives a **HomeBase Professional S1 (T9000)** over the portal's WebRTC data
- * channel instead of P2P.
+ * RTC command router: drives a **HomeBase S1 Pro (T9000)** over the portal's WebRTC data channel instead
+ * of P2P.
  *
- * The T9000 has no reachable P2P endpoint (every `device.set` over P2P times out), but it accepts the
- * app/portal's control channel: sign → WS join → scall → SDP answer → ICE → DTLS → SCTP data channels,
- * with commands riding `WebrtcDataChannel` as portal packets (see `portal-packet.ts`).
+ * The T9000 answers no P2P lookup, but it accepts the portal's control channel: sign → WS join → scall →
+ * SDP answer → ICE over the relay the hub grants → DTLS → SCTP data channels, with commands riding
+ * `WebrtcDataChannel` as portal packets (see {@link buildPortalPacket}).
  *
- * ⚠️ ICE policy MUST be `relay` (or `all` with the relay reachable): the hub completes DTLS **only
- * through TURN**. On a host-only pair ICE connects and the DTLS handshake times out, every time
- * (measured on firmware 4.4.0.4, 2026-09-25 — a full night of negatives that all traced back to a
- * host-only default). The relay is granted by the hub itself in the scall `status:100` reply.
+ * `set-payload` rides the `1350` SET_PAYLOAD envelope, inner `{account_id, cmd, mValue3, payload}`, on
+ * the station channel `255`: the frame the app sends for arming (`cmd 1224`, `{mode_type, user_name}`),
+ * answered by a `1350` ACK and a pushed `1151` MODE_SWITCH. `set-json` rides the `1700` CONTROL_PAYLOAD
+ * envelope, inner `{account_id, cmd, commandType, data}`. An attached device's command shares its parent
+ * station's session and keeps the device's channel. Other command kinds are refused.
  *
- * What rides here today is the `set-payload` envelope (`1350` SET_PAYLOAD, inner
- * `{account_id, cmd, mValue3, payload}`) on the station channel `255` — the exact frame the app sends
- * for arming (`cmd 1224`, `{mode_type, user_name}`), ✅ verified live end-to-end on a T9000 4.4.0.4
- * (2026-09-25 23:55): ACK `1350 err=0`, `1151` MODE_SWITCH pushed back, cloud state updated within 1 s.
- * Attached-device commands share their parent station session and keep their device channel.
- * `set-json` uses the `1700` CONTROL_PAYLOAD envelope with `{account_id, cmd, commandType, data}`.
- * Other command kinds are refused with a clear error rather than silently misrouted.
- *
- * One session per station, reused across commands and closed after {@link RtcCommandRouterDeps.idleCloseMs}
- * of inactivity. Sends on a session are serialised; an ACK is correlated by its outer command and
- * segment, since it carries no inner command. An ACK is not an observation of the resulting state.
+ * One session per station, reused across commands and closed after {@link IDLE_CLOSE_MS} without one.
+ * Sends on a session are serialised; an ACK is correlated by its outer command and segment, since it
+ * carries no inner command. An ACK is not an observation of the resulting state.
  */
 import type { Command } from "../../core/contracts.js";
 import type { EufyDevice } from "../../core/types.js";
 import type { Logger } from "../../core/logger.js";
 import { RtcSession, type RtcSessionOptions } from "./session.js";
 import { buildPortalPacket, parsePortalPacket, PortalLinkType, SegmentCounter } from "./portal-packet.js";
-import { RtcLive, type RtcLiveConsumer } from "./live.js";
-import { openReadableFromConsumer } from "../p2p/readable-egress.js";
-import type { Consumer } from "../p2p/shared-live-source.js";
-import { jpegGeometry } from "../p2p/media.js";
-import { LiveSnapshotUnavailableError, type MediaProvider, type LiveStreamConsumer } from "../../core/contracts.js";
-import { spawn } from "node:child_process";
-import { PORTAL_CMD_SET_PAYLOAD, PORTAL_STATION_CHANNEL } from "./commands.js";
 
+/** The SET_PAYLOAD envelope. */
+const PORTAL_CMD_SET_PAYLOAD = 1350;
 /** The CONTROL_PAYLOAD envelope for a commandType/data request. */
 const PORTAL_CMD_CONTROL_PAYLOAD = 1700;
-
 /** The envelope carrying a correlated JSON control result. */
 const PORTAL_CMD_NOTIFY_PAYLOAD = 1351;
+/** The channel a station-wide command is addressed to. */
+const PORTAL_STATION_CHANNEL = 255;
+
+/** How long a command waits for its envelope ACK. */
+const ACK_TIMEOUT_MS = 8_000;
+/**
+ * How long a session has to come up. A healthy hub answers in ~2 s; the bound sits under the ~15 s a
+ * service call is commonly given, so a hub outage surfaces as this router's error.
+ */
+const CONNECT_TIMEOUT_MS = 12_000;
+/** An idle station session is closed after this long. */
+const IDLE_CLOSE_MS = 60_000;
 
 export interface RtcIdentity {
   authToken: string;
   userId: string;
-  /** The cloud `user_id` the gtoken derives from (falls back to `userId`). */
-  accountUserId?: string;
-  /** The `gtoken` header value, when the caller already derives it (same as its HTTP calls). */
-  gtoken?: string;
+  /** The `gtoken` header value the mega session's authed HTTP calls carry. */
+  gtoken: string;
 }
 
 export interface RtcCommandRouterDeps {
   /** The logged-in session's credentials; `undefined` while logged out. */
   identity: () => RtcIdentity | undefined;
-  /** The mega shard the account signs on (`"ie-pr"`, `"eu-pr"`, `"us-pr"`) — picks the smart host. */
+  /** The mega shard the account signs on (`"ie-pr"`, `"eu-pr"`, `"us-pr"`); picks the smart host. */
   shard: () => string;
   /** ISO country sent on the sign request (default `US`). */
   country?: string;
-  /** The acting account name commands attribute themselves to (`user_name`). */
-  accountName: () => string;
-  /** Resolve a device record by serial (model, adminUserId, stationSn). */
+  /** Resolve a device record by serial (model, member, stationSn). */
   findDevice: (sn: string) => EufyDevice | undefined;
   logger?: Logger;
-  /** `relay` (default) or `all`. Never `host-only` — see the module doc. */
-  icePolicy?: "relay" | "all";
-  /** How long a command waits for its envelope ACK (default 8 s). */
-  ackTimeoutMs?: number;
-  /**
-   * How long to wait for the session to come up (default 12 s). A healthy hub answers in ~2 s; the
-   * default sits under the ~15 s timeout a typical host applies to a service call, so a hub outage
-   * surfaces as this router's own error rather than the caller's timeout.
-   */
-  connectTimeoutMs?: number;
-  /** Close an idle station session after this long (default 60 s). */
-  idleCloseMs?: number;
   onError?: (e: Error) => void;
-  /** ffmpeg for the live still (default `ffmpeg` on PATH). */
-  ffmpegPath?: string;
-  ffmpegLogLevel?: string;
-  /** Session factory (tests inject a fake). */
   createSession?: (opts: RtcSessionOptions) => RtcSession;
 }
 
@@ -90,13 +69,10 @@ interface StationSession {
   /** Serialises sends so ACKs can't be attributed to the wrong command. */
   queue: Promise<unknown>;
   idle?: ReturnType<typeof setTimeout>;
-  /** Holders (a live view) that keep the session from idle-closing. */
-  leases: number;
 }
 
 export class RtcCommandRouter {
   private readonly sessions = new Map<string, StationSession>();
-  private readonly lives = new Map<string, RtcLive>();
 
   constructor(private readonly deps: RtcCommandRouterDeps) {}
 
@@ -105,8 +81,8 @@ export class RtcCommandRouter {
     return /^T9000/i.test(dev.model ?? "") && (!dev.stationSn || dev.stationSn === dev.sn);
   }
 
-  /** A camera attached to a T9000 station: its live view rides the station's control channel. */
-  static claimsMedia(dev: EufyDevice, stationOf: (sn: string) => EufyDevice | undefined): boolean {
+  /** A device attached to a T9000 station: its commands ride the station's session. */
+  static claimsAttached(dev: EufyDevice, stationOf: (sn: string) => EufyDevice | undefined): boolean {
     if (!dev.stationSn || dev.stationSn === dev.sn) return false;
     const station = stationOf(dev.stationSn);
     return !!station && RtcCommandRouter.claimsDevice(station);
@@ -114,9 +90,7 @@ export class RtcCommandRouter {
 
   async dispatchCommand(sn: string, cmd: Command): Promise<void> {
     if (cmd.kind !== "set-payload" && cmd.kind !== "set-json") {
-      throw new Error(
-        `rtc: ${cmd.kind} is not routable over the T9000 control channel yet (only set-payload or set-json)`,
-      );
+      throw new Error(`rtc: ${cmd.kind} is not routable over the T9000 control channel (only set-payload or set-json)`);
     }
     const dev = this.deps.findDevice(sn);
     const stationSn = dev?.stationSn || sn;
@@ -151,22 +125,13 @@ export class RtcCommandRouter {
 
   /** Tear down every station session (logout / shutdown). */
   close(): void {
-    this.lives.clear();
-    for (const [sn, st] of this.sessions) {
-      if (st.idle) clearTimeout(st.idle);
-      try {
-        st.session.close();
-      } catch {
-        /* already gone */
-      }
-      this.sessions.delete(sn);
-    }
+    for (const [sn, st] of this.sessions) this.drop(sn, st);
   }
 
   /**
    * Completes on the command ACK or a correlated control-result notification. The notification must
    * match the request channel, parameter and segment and contain a structured payload. Receipt does
-   * not establish physical actuation. The command is sent once and retains the existing deadline.
+   * not establish physical actuation. The command is sent once, bounded by {@link ACK_TIMEOUT_MS}.
    */
   private sendAwaitAck(
     sn: string,
@@ -177,7 +142,6 @@ export class RtcCommandRouter {
     channel: number,
     segment: number,
   ): Promise<void> {
-    const timeoutMs = this.deps.ackTimeoutMs ?? 8_000;
     return new Promise<void>((resolve, reject) => {
       const onData = (frame: Buffer, linkType: number) => {
         const p = parsePortalPacket(frame, linkType);
@@ -212,8 +176,8 @@ export class RtcCommandRouter {
       };
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error(`rtc: ${sn} cmd ${innerCmd} ACK timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+        reject(new Error(`rtc: ${sn} cmd ${innerCmd} ACK timed out after ${ACK_TIMEOUT_MS}ms`));
+      }, ACK_TIMEOUT_MS);
       const cleanup = () => {
         clearTimeout(timer);
         st.session.off("commandData", onData);
@@ -241,20 +205,16 @@ export class RtcCommandRouter {
     }
     const session = (this.deps.createSession ?? ((o: RtcSessionOptions) => new RtcSession(o)))({
       authToken: identity.authToken,
-      userId: identity.userId,
-      accountUserId: identity.accountUserId,
       gtoken: identity.gtoken,
       stationSn: sn,
       adminUserId,
-      shard: this.deps.shard() as never,
+      shard: this.deps.shard(),
       country: this.deps.country ?? "US",
-      channelId: 0,
       logger: this.deps.logger,
-      peer: { logger: this.deps.logger, icePolicy: this.deps.icePolicy ?? "relay" },
+      peer: { logger: this.deps.logger },
     });
-    const connectTimeoutMs = this.deps.connectTimeoutMs ?? 12_000;
-    const ready = this.bringUp(sn, session, connectTimeoutMs);
-    const st: StationSession = { session, seg: new SegmentCounter(), ready, queue: Promise.resolve(), leases: 0 };
+    const ready = this.bringUp(sn, session);
+    const st: StationSession = { session, seg: new SegmentCounter(), ready, queue: Promise.resolve() };
     session.on("error", (e) => this.deps.onError?.(e));
     session.on("close", () => {
       if (this.sessions.get(sn) === st) this.sessions.delete(sn);
@@ -271,11 +231,12 @@ export class RtcCommandRouter {
   }
 
   /**
-   * One bounded bring-up: the session is up when its command channel opens, and it fails — with the
-   * session closed and every listener gone — when `connect()` throws, the session closes first, or the
-   * deadline passes. A single promise, so an early failure cannot leave a second one rejecting unheard.
+   * One bounded bring-up: the session is up when its command channel opens, and it fails, with the
+   * session closed and every listener gone, when `connect()` throws, the session closes first, or
+   * {@link CONNECT_TIMEOUT_MS} passes. A single promise, so an early failure cannot leave a second one
+   * rejecting unheard.
    */
-  private bringUp(sn: string, session: RtcSession, connectTimeoutMs: number): Promise<void> {
+  private bringUp(sn: string, session: RtcSession): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       const finish = (err?: Error) => {
@@ -292,15 +253,15 @@ export class RtcCommandRouter {
           }
           reject(err);
         } else {
-          this.deps.logger?.info?.(`[rtc] ${sn} command channel up (${this.deps.icePolicy ?? "relay"})`);
+          this.deps.logger?.info?.(`[rtc] ${sn} command channel up`);
           resolve();
         }
       };
       const onConnected = () => finish();
       const onClose = () => finish(new Error(`rtc: ${sn} session closed before the command channel opened`));
       const timer = setTimeout(
-        () => finish(new Error(`rtc: ${sn} did not come up within ${connectTimeoutMs}ms`)),
-        connectTimeoutMs,
+        () => finish(new Error(`rtc: ${sn} did not come up within ${CONNECT_TIMEOUT_MS}ms`)),
+        CONNECT_TIMEOUT_MS,
       );
       session.once("connected", onConnected);
       session.once("close", onClose);
@@ -312,144 +273,8 @@ export class RtcCommandRouter {
 
   private touch(sn: string, st: StationSession): void {
     if (st.idle) clearTimeout(st.idle);
-    if (st.leases > 0) return; // a live view holds the session open
-    const idleMs = this.deps.idleCloseMs ?? 60_000;
-    st.idle = setTimeout(() => this.drop(sn, st), idleMs);
+    st.idle = setTimeout(() => this.drop(sn, st), IDLE_CLOSE_MS);
     st.idle.unref?.();
-  }
-
-  /**
-   * The station's session for media that must ride the SAME session as the commands (one RTC session per
-   * account), with a lease that keeps it from idle-closing until released.
-   */
-  async sessionFor(
-    stationSn: string,
-  ): Promise<{ session: RtcSession; seg: SegmentCounter; accountId: string; release: () => void }> {
-    const dev = this.deps.findDevice(stationSn);
-    const identity = this.deps.identity();
-    if (!identity) throw new Error(`rtc: not logged in, cannot open ${stationSn}`);
-    const member = ((dev?.raw ?? {}) as { member?: { admin_user_id?: unknown } }).member;
-    const accountId = (typeof member?.admin_user_id === "string" && member.admin_user_id) || identity.userId;
-    const st = await this.stationSession(stationSn, accountId, identity);
-    st.leases++;
-    if (st.idle) clearTimeout(st.idle);
-    let released = false;
-    return {
-      session: st.session,
-      seg: st.seg,
-      accountId,
-      release: () => {
-        if (released) return;
-        released = true;
-        st.leases = Math.max(0, st.leases - 1);
-        this.touch(stationSn, st);
-      },
-    };
-  }
-
-  /** The live view of a camera on a T9000, one per (station, channel), started/stopped with its consumers. */
-  private async liveFor(sn: string): Promise<RtcLive> {
-    const dev = this.deps.findDevice(sn);
-    if (!dev?.stationSn) throw new Error(`rtc live: ${sn} is not attached to a station`);
-    const raw = (dev.raw ?? {}) as { device_channel?: unknown };
-    const channel = typeof raw.device_channel === "number" ? raw.device_channel : Number(raw.device_channel);
-    if (!Number.isInteger(channel)) throw new Error(`rtc live: ${sn} has no device_channel`);
-    const existing = this.lives.get(sn);
-    if (existing?.active) return existing;
-    const lease = await this.sessionFor(dev.stationSn);
-    const live = new RtcLive({
-      session: lease.session,
-      seg: lease.seg,
-      stationSn: dev.stationSn,
-      channel,
-      accountId: lease.accountId,
-      logger: this.deps.logger,
-      onIdle: () => {
-        if (this.lives.get(sn) === live) this.lives.delete(sn);
-        lease.release();
-      },
-    });
-    this.lives.set(sn, live);
-    return live;
-  }
-
-  /**
-   * A {@link MediaProvider} for a camera on a T9000: live video over the station's control channel
-   * (HEVC Annex B). Recording, talkback and P2P queries have no wire here yet and are refused.
-   */
-  mediaProviderFor(sn: string): MediaProvider {
-    const unsupported = (what: string) =>
-      new Error(`${what} is not available for a T9000 camera over the control channel`);
-    const attach = async (): Promise<RtcLiveConsumer> => (await this.liveFor(sn)).attach();
-    const openReadable: NonNullable<MediaProvider["openReadable"]> = async (opts) => {
-      const consumer = await attach();
-      const readable = openReadableFromConsumer(consumer as unknown as Consumer, opts);
-      opts?.signal?.addEventListener("abort", () => readable.destroy(), { once: true });
-      return readable;
-    };
-    return {
-      live: async (): Promise<LiveStreamConsumer> => attach(),
-      openReadable,
-      snapshotLive: async (opts) => {
-        const timeoutMs = opts?.timeoutMs ?? 15_000;
-        const readable = await openReadable();
-        const args = [
-          "-hide_banner",
-          "-loglevel",
-          this.deps.ffmpegLogLevel ?? "error",
-          "-f",
-          "hevc",
-          "-i",
-          "pipe:0",
-          "-frames:v",
-          "1",
-          "-f",
-          "image2",
-          "pipe:1",
-        ];
-        const ff = spawn(this.deps.ffmpegPath ?? "ffmpeg", args, { stdio: ["pipe", "pipe", "ignore"] });
-        const chunks: Buffer[] = [];
-        const jpeg = await new Promise<Buffer>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            ff.kill("SIGKILL");
-            reject(new LiveSnapshotUnavailableError("no-keyframe", `no keyframe decoded within ${timeoutMs}ms`));
-          }, timeoutMs);
-          ff.stdout.on("data", (c: Buffer) => chunks.push(c));
-          ff.on("error", (e) => {
-            clearTimeout(timer);
-            reject(e);
-          });
-          ff.on("close", () => {
-            clearTimeout(timer);
-            const out = Buffer.concat(chunks);
-            out.length
-              ? resolve(out)
-              : reject(new LiveSnapshotUnavailableError("undecodable-burst", "ffmpeg produced no image"));
-          });
-          readable.on("error", () => ff.stdin.end());
-          readable.pipe(ff.stdin);
-        }).finally(() => readable.destroy());
-        const geometry = jpegGeometry(jpeg);
-        if (!geometry)
-          throw new LiveSnapshotUnavailableError("undecodable-burst", "decoded image has no JPEG geometry");
-        return { jpeg, ...geometry };
-      },
-      record: async () => {
-        throw unsupported("record");
-      },
-      recordFragments: () => {
-        throw unsupported("recordFragments");
-      },
-      talkback: async () => {
-        throw unsupported("talkback");
-      },
-      p2pQuery: async () => {
-        throw unsupported("p2pQuery");
-      },
-      p2pControlQuery: async () => {
-        throw unsupported("p2pControlQuery");
-      },
-    } as MediaProvider;
   }
 
   private drop(sn: string, st: StationSession): void {

@@ -30,7 +30,6 @@
  */
 
 import { isPortalPacket, PortalLinkType } from "./portal-packet.js";
-import type { PortalFramer } from "./framer.js";
 
 const MAGIC = Buffer.from("PTCS", "ascii");
 export const PTCS_HEADER_LENGTH = 28;
@@ -210,8 +209,12 @@ export interface PtcsFramerOptions {
   now?: () => number;
 }
 
-/** The {@link PortalFramer} the session uses: PTCS out, PTCS in, with the portal's channel mapping. */
-export class PtcsFramer implements PortalFramer {
+/**
+ * The framer between portal packets and the data channel: PTCS out, PTCS in, with the portal's channel
+ * mapping. An inbound bare `XZYH` packet, which the hub sometimes answers with, passes through as a
+ * command frame.
+ */
+export class PtcsFramer {
   private onWire?: (packet: Buffer) => void;
   private onFrame?: (frame: Buffer, linkType: number) => void;
   private reassembler?: PtcsReassembler;
@@ -257,7 +260,6 @@ export class PtcsFramer implements PortalFramer {
 
   recvPacket(wirePacket: Buffer): void {
     if (!this.ready) return;
-    // The hub sometimes answers with a bare portal packet; pass it through as a command frame.
     if (isPortalPacket(wirePacket)) {
       this.onFrame?.(wirePacket, PortalLinkType.COMMAND);
       return;

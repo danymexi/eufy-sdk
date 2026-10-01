@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import type { RtcPeer, TurnConfig } from "../peer.js";
 import { scallJsonToSdp } from "../scall-sdp.js";
-import { RtcSession } from "../session.js";
+import { MAX_CALL_RETRIES, RtcSession } from "../session.js";
 import type { RtcInnerMessage, RtcSignalingClient } from "../signaling.js";
 
 class FakeSignaling extends EventEmitter {
@@ -35,20 +35,20 @@ class FakePeer extends EventEmitter {
   isCommandChannelReady = false;
 }
 
-const TURN: TurnConfig = { turn_addr: "13.248.157.102", turn_port: 3478, turn_user: "u", turn_password: "p" };
+const TURN: TurnConfig = { turn_addr: "203.0.113.30", turn_port: 3478, turn_user: "u", turn_password: "p" };
 const HUB_SDP = {
   setup: "actpass",
   ice: { ufrag: "a", pwd: "b", fingerprint: "cd" },
-  candidate: ["1 1 udp 1 192.168.1.10 1 typ host"],
+  candidate: ["1 1 udp 1 192.0.2.10 1 typ host"],
 };
 
-function setup(overrides: { maxCallRetries?: number } = {}) {
+function setup() {
   const sig = new FakeSignaling();
   const peer = new FakePeer();
   const sleeps: number[] = [];
   const session = new RtcSession({
     authToken: "T",
-    userId: "u",
+    gtoken: "G",
     stationSn: "T9000P0000000001",
     adminUserId: "a",
     shard: "eu-pr",
@@ -58,8 +58,6 @@ function setup(overrides: { maxCallRetries?: number } = {}) {
     sleep: async (ms) => {
       sleeps.push(ms);
     },
-    authTimeoutMs: 100,
-    ...overrides,
   });
   const errors: Error[] = [];
   session.on("error", (e) => errors.push(e));
@@ -90,8 +88,16 @@ describe("RtcSession", () => {
   });
 
   it("times out when the hub never authenticates", async () => {
-    const s = setup();
-    await expect(s.session.connect()).rejects.toThrow(/auth timeout/);
+    vi.useFakeTimers();
+    try {
+      const s = setup();
+      const connecting = s.session.connect();
+      const settled = expect(connecting).rejects.toThrow(/auth timeout/);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await settled;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("runs the whole exchange: grant → offer → answer → trickle → ack → open", async () => {
@@ -114,17 +120,17 @@ describe("RtcSession", () => {
     await flush();
     expect(s.peer.handleRemoteOffer).toHaveBeenCalledTimes(1);
 
-    s.sig.hub({ action: 3, dataType: "info", data: { candidate: "1 1 udp 1 192.168.1.10 2 typ host" } });
+    s.sig.hub({ action: 3, dataType: "info", data: { candidate: "1 1 udp 1 192.0.2.10 2 typ host" } });
     s.sig.hub({
       action: 3,
       dataType: "info",
-      data: { format: "CANDIDATE", value: "1 1 udp 1 192.168.1.10 3 typ host" },
+      data: { format: "CANDIDATE", value: "1 1 udp 1 192.0.2.10 3 typ host" },
     });
     s.sig.hub({ action: 3, dataType: "info", data: { candidate: "" } });
     await flush();
     expect(s.peer.addRemoteCandidate.mock.calls.map((c) => c[0])).toEqual([
-      "1 1 udp 1 192.168.1.10 2 typ host",
-      "1 1 udp 1 192.168.1.10 3 typ host",
+      "1 1 udp 1 192.0.2.10 2 typ host",
+      "1 1 udp 1 192.0.2.10 3 typ host",
     ]);
 
     s.peer.emit("iceCandidate", "our-host");
@@ -148,45 +154,41 @@ describe("RtcSession", () => {
     expect(s.session.isConnected).toBe(true);
 
     const frames: Array<[string, number]> = [];
-    const media: Array<[string, number]> = [];
     s.session.on("commandData", (f, lt) => frames.push([f.toString(), lt]));
-    s.session.on("mediaData", (f, lt) => media.push([f.toString(), lt]));
     s.peer.emit("data", "notify", Buffer.from("XZYH"), 3);
-    s.peer.emit("data", "video", Buffer.from("v"), 5);
-    s.peer.emit("data", "playback", Buffer.from("p"), 4);
     expect(frames).toEqual([["XZYH", 3]]);
-    expect(media).toEqual([
-      ["v", 5],
-      ["p", 4],
-    ]);
     expect(s.session.sendCommand(Buffer.from("XZYH"))).toBe(true);
     expect(s.errors).toEqual([]);
   });
 
-  it("initialises the peer without TURN when the hub offers before it grants", async () => {
+  it("reports an offer that arrives before the relay grant and answers the one after it", async () => {
     const s = await authenticated(setup());
     s.sig.hub({ action: 3, dataType: "info", data: { format: "SDP", value: JSON.stringify(HUB_SDP) } });
     await flush();
-    expect(s.peer.init).toHaveBeenCalledWith();
+    expect(s.peer.init).not.toHaveBeenCalled();
+    expect(s.peer.handleRemoteOffer).not.toHaveBeenCalled();
+    expect(s.errors.map((e) => e.message)).toEqual(["RTC T9000P0000000001 offered before granting a relay"]);
+    s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });
+    s.sig.hub({ action: 3, dataType: "info", data: { format: "SDP", value: JSON.stringify(HUB_SDP) } });
+    await flush();
     expect(s.peer.handleRemoteOffer).toHaveBeenCalledTimes(1);
   });
 
   it("backs off and calls again on 486/408, then gives up", async () => {
-    const s = await authenticated(setup({ maxCallRetries: 2 }));
+    const s = await authenticated(setup());
+    const statuses = [486, 408, 486];
+    for (const [i, status] of statuses.entries()) {
+      s.sig.hub({ action: 3, dataType: "scall", data: { status } });
+      await flush();
+      expect(s.sig.sendCall).toHaveBeenCalledTimes(i + 2);
+    }
+    expect(s.sig.sendHangup).toHaveBeenCalledTimes(3);
+    expect(s.peer.close).toHaveBeenCalledTimes(3);
+    expect(s.sleeps).toEqual([10_000, 15_000, 20_000]);
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 486 } });
     await flush();
-    expect(s.sig.sendHangup).toHaveBeenCalledTimes(1);
-    expect(s.peer.close).toHaveBeenCalledTimes(1);
-    expect(s.sleeps).toEqual([10_000]);
-    expect(s.sig.sendCall).toHaveBeenCalledTimes(2);
-    s.sig.hub({ action: 3, dataType: "scall", data: { status: 408 } });
-    await flush();
-    expect(s.sleeps).toEqual([10_000, 15_000]);
-    expect(s.sig.sendCall).toHaveBeenCalledTimes(3);
-    s.sig.hub({ action: 3, dataType: "scall", data: { status: 486 } });
-    await flush();
-    expect(s.sig.sendCall).toHaveBeenCalledTimes(3);
-    expect(s.errors.map((e) => e.message)).toEqual(["RTC scall 486 after 2 retries"]);
+    expect(s.sig.sendCall).toHaveBeenCalledTimes(MAX_CALL_RETRIES + 1);
+    expect(s.errors.map((e) => e.message)).toEqual([`RTC scall 486 after ${MAX_CALL_RETRIES} retries`]);
   });
 
   it("reports a lost peer or socket as close, and close() hangs up both sides once", async () => {

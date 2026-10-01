@@ -7,51 +7,47 @@
  *   → scall                          (action 3, channel 0)
  *   ← scall {status: 100, turn}      the hub granted the session and handed out TURN credentials
  *   ← info  {sdp | format:"SDP"}     the hub's offer, as scall JSON
- *   → info  {sdp}                    our answer, channel 0
- *   ↔ info  {candidate}              trickle ICE, channel 1; "" ends it
+ *   → info  {sdp}                    the answer, on the session's channel (0, the hub)
+ *   ↔ info  {candidate}              trickle ICE on the same channel; "" ends it
  *   ← scall {status: 200}            → ack
  *   ← scall {status: 486 | 408}      busy / timeout — hang up, back off, call again (bounded)
  *   ← hangup                         the hub ended it
  *
- * Both the signalling client and the peer are injectable, so the whole sequence is testable offline.
+ * The command data channel is the session: `close` fires when it closes, or when the peer fails, even
+ * while the peer connection is nominally up. `486`/`408` retries are bounded by {@link MAX_CALL_RETRIES}
+ * and backed off 5 s more per retry, capped at 30 s.
+ *
+ * Both the signalling client and the peer are injectable.
  */
 
 import { EventEmitter } from "node:events";
 import { noopLogger, type Logger } from "../../core/logger.js";
 import { RtcPeer, type RtcPeerOptions, type TurnConfig } from "./peer.js";
-import { PortalLinkType } from "./portal-packet.js";
 import { scallJsonToSdp, toWireCandidate } from "./scall-sdp.js";
 import { RtcSignalingClient, type RtcInnerMessage, type RtcSignalingOptions } from "./signaling.js";
 
 export interface RtcSessionOptions extends RtcSignalingOptions {
-  /** 0 = the hub itself; a camera channel for per-camera calls. */
-  channelId?: number;
   peer?: RtcPeerOptions;
-  /** Test seams. */
   createSignaling?: (opts: RtcSignalingOptions) => RtcSignalingClient;
   createPeer?: (opts: RtcPeerOptions) => RtcPeer;
-  authTimeoutMs?: number;
-  /** How many `486`/`408` retries before giving up. */
-  maxCallRetries?: number;
   sleep?: (ms: number) => Promise<void>;
 }
+
+/** The session channel: 0 addresses the hub itself. */
+const HUB_CHANNEL = 0;
+/** How long the signalling auth may take. */
+const AUTH_TIMEOUT_MS = 15_000;
+/** How many `486`/`408` retries before giving up. */
+export const MAX_CALL_RETRIES = 3;
 
 export interface RtcSessionEvents {
   connected: [];
   turn: [turn: TurnConfig];
   close: [];
   error: [err: Error];
-  /** A frame off the command/notify path: portal packet bytes + the link type it arrived on. */
+  /** A reassembled frame: portal packet bytes + the link type it arrived on. */
   commandData: [frame: Buffer, linkType: number];
-  /** A frame off the live / playback / file path — media, for a per-camera session. */
-  mediaData: [frame: Buffer, linkType: number];
 }
-
-const MEDIA_LINK_TYPES: ReadonlySet<number> = new Set([
-  PortalLinkType.LIVE,
-  PortalLinkType.PLAYBACK,
-  PortalLinkType.FILE,
-]);
 
 interface CallPayload {
   status?: number;
@@ -70,7 +66,6 @@ const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
 export class RtcSession extends EventEmitter<RtcSessionEvents> {
   private readonly signaling: RtcSignalingClient;
   private readonly peer: RtcPeer;
-  private readonly channelId: number;
   private readonly logger: Logger;
   private readonly sleep: (ms: number) => Promise<void>;
   private turn?: TurnConfig;
@@ -83,7 +78,6 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
 
   constructor(private readonly opts: RtcSessionOptions) {
     super();
-    this.channelId = opts.channelId ?? 0;
     this.logger = opts.logger ?? noopLogger;
     this.sleep = opts.sleep ?? defaultSleep;
     this.signaling = (opts.createSignaling ?? ((o) => new RtcSignalingClient(o)))(opts);
@@ -103,23 +97,14 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     });
     this.signaling.on("error", (e) => this.emit("error", e));
 
-    // The portal answers on channel 0 and trickles ICE on channel 1.
-    // Trickled candidates ride the SAME channel as the session's SDP and scall, not a fixed channel 1.
-    // The portal sends both its SDP answer and every candidate on `this.channel` (the session's own
-    // channelId); pinning candidates to 1 while the session is channel 0 hands the hub candidates it
-    // cannot bind to the DTLS association it just offered — ICE still comes up on the host pair, but
-    // the handshake never completes because the answer and its transport parameters are split across
-    // two channels.
-    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c), this.channelId));
-    this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate("", this.channelId));
+    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c), HUB_CHANNEL));
+    this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate("", HUB_CHANNEL));
     this.peer.on("commandChannelOpen", () => {
       if (this.connected) return;
       this.connected = true;
       this.logger.debug(`[rtc] ${this.opts.stationSn} command channel open`);
       this.emit("connected");
     });
-    // The command channel IS the session: if it goes, stop reporting connected even when the peer
-    // connection itself is still nominally up.
     this.peer.on("commandChannelClosed", () => {
       if (!this.connected || this.closed) return;
       this.connected = false;
@@ -133,10 +118,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       }
     });
     this.peer.on("error", (e) => this.emit("error", e));
-    this.peer.on("data", (_label, frame, linkType) => {
-      if (MEDIA_LINK_TYPES.has(linkType)) this.emit("mediaData", frame, linkType);
-      else this.emit("commandData", frame, linkType);
-    });
+    this.peer.on("data", (_label, frame, linkType) => this.emit("commandData", frame, linkType));
   }
 
   get isConnected(): boolean {
@@ -149,7 +131,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     await this.signaling.connect();
     await this.waitForAuth();
     this.logger.debug(`[rtc] ${this.opts.stationSn} authenticated — scall`);
-    this.signaling.sendCall(this.channelId);
+    this.signaling.sendCall(HUB_CHANNEL);
   }
 
   /** Send one portal packet; false when the command channel isn't open. */
@@ -157,17 +139,12 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     return this.peer.sendCommand(portalPacket);
   }
 
-  /** Send unframed bytes on the command channel (the portal's raw keepalive); false when not open. */
-  sendRaw(bytes: Buffer): boolean {
-    return this.peer.sendRaw(bytes);
-  }
-
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.connected = false;
     try {
-      if (this.signaling.isOpen) this.signaling.sendHangup(this.channelId);
+      if (this.signaling.isOpen) this.signaling.sendHangup(HUB_CHANNEL);
     } catch {
       /* the socket may already be gone */
     }
@@ -177,7 +154,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
 
   private waitForAuth(): Promise<void> {
     if (this.authOk) return Promise.resolve();
-    const timeoutMs = this.opts.authTimeoutMs ?? 15_000;
+    const timeoutMs = AUTH_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.signaling.off("message", onMsg);
@@ -231,14 +208,14 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       return;
     }
     if (status === 200) {
-      this.signaling.sendAck(this.channelId);
+      this.signaling.sendAck(HUB_CHANNEL);
       return;
     }
     if (status === 486 || status === 408) {
       this.callRetries++;
       this.logger.warn(`[rtc] ${this.opts.stationSn} scall ${status}, retry ${this.callRetries}`);
       try {
-        this.signaling.sendHangup(this.channelId);
+        this.signaling.sendHangup(HUB_CHANNEL);
       } catch {
         /* not fatal */
       }
@@ -246,18 +223,22 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       this.sdpHandled = false;
       this.turn = undefined;
       this.connected = false;
-      if (this.callRetries > (this.opts.maxCallRetries ?? 3)) {
+      if (this.callRetries > MAX_CALL_RETRIES) {
         this.emit("error", new Error(`RTC scall ${status} after ${this.callRetries - 1} retries`));
         return;
       }
       await this.sleep(Math.min(5_000 + this.callRetries * 5_000, 30_000));
-      if (!this.closed) this.signaling.sendCall(this.channelId);
+      if (!this.closed) this.signaling.sendCall(HUB_CHANNEL);
     }
   }
 
+  /**
+   * An `info`: trickle ICE, in either of the two shapes the hub sends, or the hub's SDP offer. The offer
+   * is answered only once a TURN grant is in: the peer is relay-only, so an offer ahead of `scall 100`
+   * is reported and left unanswered.
+   */
   private async onInfo(payload: InfoPayload): Promise<void> {
     if (this.closed) return;
-    // Trickle ICE in either of the two shapes the portal has used.
     if (payload.format === "CANDIDATE") {
       if (payload.value) this.peer.addRemoteCandidate(payload.value);
       return;
@@ -269,12 +250,11 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     const sdpText = payload.value ?? payload.sdp;
     if (!sdpText || (payload.format !== "SDP" && !payload.sdp)) return;
     if (this.sdpHandled) return;
-    this.sdpHandled = true;
     if (!this.turn) {
-      // The hub normally grants (scall 100) before it offers; the peer initialises without TURN
-      // under host-only ICE anyway, so an offer-first hub is not fatal.
-      await this.peer.init();
+      this.emit("error", new Error(`RTC ${this.opts.stationSn} offered before granting a relay`));
+      return;
     }
+    this.sdpHandled = true;
     let offer: string;
     try {
       offer = scallJsonToSdp(JSON.parse(sdpText));
@@ -282,7 +262,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       offer = sdpText;
     }
     const answer = await this.peer.handleRemoteOffer(offer);
-    this.signaling.sendInfoSdp(this.peer.answerAsScallJson(answer), this.channelId);
+    this.signaling.sendInfoSdp(this.peer.answerAsScallJson(answer), HUB_CHANNEL);
     this.logger.debug(`[rtc] ${this.opts.stationSn} answered the hub's offer`);
   }
 }

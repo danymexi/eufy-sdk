@@ -3,7 +3,6 @@ import {
   ANKER_MAX_MESSAGE_SIZE,
   HUB_SDP_MID,
   iceCandidateType,
-  keepHostCandidates,
   pinMaxMessageSize,
   scallJsonToSdp,
   sdpToScallJson,
@@ -19,8 +18,8 @@ const HUB_JSON = {
     fingerprint: "0a1b2c3d",
   },
   candidate: [
-    "1 1 udp 2130706431 192.168.1.10 47470 typ host",
-    "2 1 udp 1694498815 203.0.113.10 47470 typ srflx raddr 192.168.1.10 rport 47470",
+    "1 1 udp 2130706431 192.0.2.10 47470 typ host",
+    "2 1 udp 1694498815 203.0.113.10 47470 typ srflx raddr 192.0.2.10 rport 47470",
   ],
 };
 
@@ -64,15 +63,10 @@ describe("SDP → scall JSON", () => {
 });
 
 describe("candidate helpers", () => {
-  it("names the candidate type and keeps only host lines", () => {
+  it("names the candidate type", () => {
     expect(iceCandidateType(HUB_JSON.candidate[0]!)).toBe("host");
     expect(iceCandidateType(HUB_JSON.candidate[1]!)).toBe("srflx");
     expect(iceCandidateType("garbage")).toBe("unknown");
-    const sdp = scallJsonToSdp(HUB_JSON);
-    const hostOnly = keepHostCandidates(sdp);
-    expect(hostOnly).toContain("typ host");
-    expect(hostOnly).not.toContain("typ srflx");
-    expect(hostOnly.endsWith("\r\n")).toBe(true);
   });
 
   it("pins the max message size to the hub's", () => {
@@ -83,12 +77,12 @@ describe("candidate helpers", () => {
 describe("toWireCandidate", () => {
   it("carries the attribute's value, the way the hub sends its own", () => {
     // libdatachannel hands out the SDP line; the portal protocol carries what follows `a=`.
-    expect(toWireCandidate("a=candidate:2 1 UDP 2114977535 192.168.1.20 54012 typ host")).toBe(
-      "candidate:2 1 UDP 2114977535 192.168.1.20 54012 typ host",
+    expect(toWireCandidate("a=candidate:2 1 UDP 2114977535 192.0.2.20 54012 typ host")).toBe(
+      "candidate:2 1 UDP 2114977535 192.0.2.20 54012 typ host",
     );
     // Already in wire form, or an end-of-candidates marker: unchanged.
-    expect(toWireCandidate("candidate:1 1 udp 2122317823 192.168.1.10 47336 typ host")).toBe(
-      "candidate:1 1 udp 2122317823 192.168.1.10 47336 typ host",
+    expect(toWireCandidate("candidate:1 1 udp 2122317823 192.0.2.10 47336 typ host")).toBe(
+      "candidate:1 1 udp 2122317823 192.0.2.10 47336 typ host",
     );
     expect(toWireCandidate("")).toBe("");
   });

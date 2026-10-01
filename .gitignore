@@ -17,7 +17,3 @@ docs/.vitepress/cache/
 .DS_Store
 scratch/
 
-owner-rtc-probe.mjs
-ws-diag.mjs
-start-live-probe.mjs
-raw-probe.mjs

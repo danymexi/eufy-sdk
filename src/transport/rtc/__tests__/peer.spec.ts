@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { PassthroughFramer } from "../framer.js";
 import {
   COMMAND_CHANNEL,
   DATA_CHANNEL_LABELS,
@@ -110,52 +109,37 @@ class FakePc implements NativePeerConnection {
   }
 }
 
-const HOST = "1 1 udp 2130706431 192.168.1.10 47470 typ host";
-const SRFLX = "2 1 udp 1694498815 203.0.113.10 47470 typ srflx raddr 192.168.1.10 rport 47470";
+const HOST = "1 1 udp 2130706431 192.0.2.10 47470 typ host";
+const RELAY = "3 1 udp 16777215 203.0.113.20 50612 typ relay raddr 0.0.0.0 rport 0";
+const TURN = { turn_addr: "t", turn_port: 3478, turn_user: "u", turn_password: "p" };
 const OFFER = scallJsonToSdp({
   setup: "actpass",
   ice: { ufrag: "u", pwd: "p", fingerprint: "ab" },
-  candidate: [HOST, SRFLX],
+  candidate: [HOST, RELAY],
 });
 const ANSWER =
   "v=0\r\na=setup:passive\r\na=ice-ufrag:x\r\na=ice-pwd:y\r\na=fingerprint:sha-256 aa:bb\r\na=max-message-size:65536\r\n";
 
-function setup(icePolicy: "host-only" | "all" = "host-only") {
+function setup() {
   let pc!: FakePc;
   let config!: NativePeerConfig;
   const peer = new RtcPeer({
-    icePolicy,
     createPeer: (_name, cfg) => {
       config = cfg;
       pc = new FakePc();
       return pc;
     },
-    createFramer: () => new PassthroughFramer(),
-    answerTimeoutMs: 200,
   });
   return { peer, pc: () => pc, config: () => config };
 }
 
 describe("RtcPeer", () => {
-  it("builds a host-only peer with no ICE servers and the hub's max message size", async () => {
+  it("builds a relay-only peer on the hub's TURN grant, with the hub's max message size", async () => {
     const { peer, config } = setup();
-    await peer.init({ turn_addr: "t", turn_port: 3478, turn_user: "u", turn_password: "p" });
-    expect(config()).toEqual({
-      iceServers: [],
-      iceTransportPolicy: "all",
-      maxMessageSize: ANKER_MAX_MESSAGE_SIZE,
-      enableIceTcp: true,
-    });
-    const all = setup("all");
-    await all.peer.init({
-      turn_addr: "t",
-      turn_port: 3478,
-      turn_user: "u",
-      turn_password: "p",
-      alt_turn_addr: "t2",
-      alt_turn_port: 3479,
-    });
-    expect(all.config().iceServers.map((s) => `${s.relayType}@${s.hostname}:${s.port}`)).toEqual([
+    await peer.init({ ...TURN, alt_turn_addr: "t2", alt_turn_port: 3479 });
+    expect(config().iceTransportPolicy).toBe("relay");
+    expect(config().maxMessageSize).toBe(ANKER_MAX_MESSAGE_SIZE);
+    expect(config().iceServers.map((s) => `${s.relayType}@${s.hostname}:${s.port}`)).toEqual([
       "TurnUdp@t:3478",
       "TurnTcp@t:3478",
       "TurnUdp@t2:3479",
@@ -163,84 +147,60 @@ describe("RtcPeer", () => {
     ]);
   });
 
-  it("answers the hub's offer: declares the portal's channels, strips non-host candidates, pins the size", async () => {
+  it("answers the hub's offer: pins it passive, declares the portal's channels on even ids, pins the size", async () => {
     const { peer, pc } = setup();
-    await peer.init();
+    await peer.init(TURN);
     const answering = peer.handleRemoteOffer(OFFER);
     expect(pc().channels.map((c) => c.label)).toEqual([...DATA_CHANNEL_LABELS]);
+    expect(pc().channels.map((c) => c.config?.id)).toEqual([0, 2, 4, 6, 8, 10]);
     expect(pc().remote?.type).toBe("offer");
-    expect(pc().remote?.sdp).toContain(HOST);
-    expect(pc().remote?.sdp).not.toContain("typ srflx");
+    expect(pc().remote?.sdp).toContain("a=setup:passive");
+    expect(pc().remote?.sdp).not.toContain("a=setup:actpass");
     pc().fireLocalAnswer(ANSWER);
     const answer = await answering;
     expect(answer).toContain(`a=max-message-size:${ANKER_MAX_MESSAGE_SIZE}`);
-    expect(pc().channels.map((c) => c.config?.id)).toEqual([0, 2, 4, 6, 8, 10]);
-    expect(pc().remote?.sdp).toContain("a=setup:passive"); // we pin the hub passive, so we answer active
     expect(JSON.parse(peer.answerAsScallJson(answer))).toEqual({
       setup: "passive",
       ice: { ufrag: "x", pwd: "y", fingerprint_type: "sha-256", fingerprint: "aabb" },
     });
   });
 
-  it("pins our DTLS role by pinning the complement into the hub's offer, not by editing the answer", async () => {
-    // The role has to be pinned where it is DECIDED. Rewriting our own answer changes only what we
-    // announce, never the role libdatachannel plays, and announcing a role we are not playing deadlocks
-    // the handshake. Pinning the offer leaves exactly one legal answer, so the two always agree.
-    // The default is `active` — the role the portal plays, and the one whose even stream ids the hub
-    // pairs with.
-    const dflt = setup();
-    await dflt.peer.init();
-    const a = dflt.peer.handleRemoteOffer(OFFER);
-    expect(dflt.pc().remote?.sdp).toContain("a=setup:passive");
-    expect(dflt.pc().channels.map((c) => c.config?.id)).toEqual([0, 2, 4, 6, 8, 10]);
-    dflt.pc().fireLocalAnswer(ANSWER);
-    await a;
-
-    let loose!: FakePc;
-    const peer = new RtcPeer({
-      createPeer: () => (loose = new FakePc()),
-      createFramer: () => new PassthroughFramer(),
-      answerTimeoutMs: 200,
-      dataChannelIds: "auto",
-      dtlsRole: undefined, // leave the hub's actpass alone
-    });
-    await peer.init();
-    const answering = peer.handleRemoteOffer(OFFER);
-    expect(loose.remote?.sdp).toContain("a=setup:actpass");
-    expect(loose.channels.map((c) => c.config?.id)).toEqual(new Array(DATA_CHANNEL_LABELS.length).fill(undefined));
-    loose.fireLocalAnswer(ANSWER);
-    await answering;
-  });
-
-  it("uses an answer libdatachannel already produced, and times out when it never does", async () => {
-    const { peer, pc } = setup();
-    await peer.init();
+  it("uses an answer the native peer already produced, and times out when it never does", async () => {
     const early = setup();
-    await early.peer.init();
+    await early.peer.init(TURN);
     early.pc().local = { type: "answer", sdp: ANSWER };
     await expect(early.peer.handleRemoteOffer(OFFER)).resolves.toContain("a=setup:passive");
-    await expect(peer.handleRemoteOffer(OFFER)).rejects.toThrow(/local SDP answer/);
-    expect(pc().closed).toBe(false);
+    vi.useFakeTimers();
+    try {
+      const { peer, pc } = setup();
+      await peer.init(TURN);
+      const settled = expect(peer.handleRemoteOffer(OFFER)).rejects.toThrow(/local SDP answer/);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await settled;
+      expect(pc().closed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("queues remote candidates until the offer is applied, and filters both directions by policy", async () => {
+  it("queues remote candidates until the offer is applied, and keeps only relay ones both ways", async () => {
     const { peer, pc } = setup();
-    await peer.init();
+    await peer.init(TURN);
     peer.addRemoteCandidate(HOST);
-    peer.addRemoteCandidate(SRFLX);
+    peer.addRemoteCandidate(RELAY);
     expect(pc().candidates).toEqual([]);
     const answering = peer.handleRemoteOffer(OFFER);
     pc().fireLocalAnswer(ANSWER);
     await answering;
-    expect(pc().candidates).toEqual([[HOST, "2"]]);
-    peer.addRemoteCandidate("3 1 udp 1 10.0.0.9 5 typ host");
+    expect(pc().candidates).toEqual([[RELAY, "2"]]);
+    peer.addRemoteCandidate("4 1 udp 16777215 203.0.113.21 5 typ relay");
     expect(pc().candidates).toHaveLength(2);
     const local: string[] = [];
     peer.on("iceCandidate", (c) => local.push(c));
-    pc().fireLocalCandidate(SRFLX);
     pc().fireLocalCandidate(HOST);
+    pc().fireLocalCandidate(RELAY);
     pc().fireLocalCandidate("");
-    expect(local).toEqual([HOST]);
+    expect(local).toEqual([RELAY]);
     const done = vi.fn();
     peer.on("iceGatheringComplete", done);
     pc().fireGathering("in-progress");
@@ -251,7 +211,7 @@ describe("RtcPeer", () => {
 
   it("opens the command path once the channel opens, sends through the framer, and surfaces inbound frames", async () => {
     const { peer, pc } = setup();
-    await peer.init();
+    await peer.init(TURN);
     const answering = peer.handleRemoteOffer(OFFER);
     pc().fireLocalAnswer(ANSWER);
     await answering;
@@ -265,7 +225,8 @@ describe("RtcPeer", () => {
     expect(peer.isCommandChannelReady).toBe(true);
     const packet = Buffer.from("XZYHcommand");
     expect(peer.sendCommand(packet)).toBe(true);
-    expect(cmd.sent).toEqual([packet]);
+    expect(cmd.sent).toHaveLength(1);
+    expect(cmd.sent[0]!.subarray(0, 4).toString()).toBe("PTCS");
     const frames: Array<[string, string, number]> = [];
     peer.on("data", (label, frame, lt) => frames.push([label, frame.toString(), lt]));
     cmd.fireMessage(Buffer.from("XZYHreply-16-bytes"));
@@ -274,8 +235,8 @@ describe("RtcPeer", () => {
     const video = pc().channels.find((c) => c.label === "video")!;
     video.fireMessage(Buffer.from("XZYHvideo-16-byte!"));
     video.fireMessage(Buffer.from("raw"));
-    // Every channel feeds the framer; the passthrough framer tags all of them as command frames, and
-    // a three-byte message is not a portal packet at all.
+    // Every channel feeds the framer: a bare portal packet passes through as a command frame, and a
+    // three-byte message is neither a portal packet nor a PTCS one.
     expect(frames).toEqual([
       [COMMAND_CHANNEL, "XZYHreply-16-bytes", 1],
       [COMMAND_CHANNEL, "XZYHpush--16-bytes", 1],
@@ -292,7 +253,7 @@ describe("RtcPeer", () => {
 
   it("rejects a pending local answer when the peer is closed instead of dropping it", async () => {
     const { peer } = setup();
-    await peer.init();
+    await peer.init(TURN);
     const answering = peer.handleRemoteOffer(OFFER);
     peer.close();
     await expect(answering).rejects.toThrow(/closed while waiting for the local SDP answer/);
@@ -300,7 +261,7 @@ describe("RtcPeer", () => {
 
   it("announces the command channel closing so a caller stops believing it is ready", async () => {
     const { peer, pc } = setup();
-    await peer.init();
+    await peer.init(TURN);
     const answering = peer.handleRemoteOffer(OFFER);
     pc().fireLocalAnswer(ANSWER);
     await answering;
@@ -323,7 +284,7 @@ describe("RtcPeer", () => {
 
   it("reports a refused native send as a failed command instead of a silent success", async () => {
     const { peer, pc } = setup();
-    await peer.init();
+    await peer.init(TURN);
     const answering = peer.handleRemoteOffer(OFFER);
     pc().fireLocalAnswer(ANSWER);
     await answering;
@@ -338,7 +299,7 @@ describe("RtcPeer", () => {
   it("refuses to work before init and to handle two offers at once", async () => {
     const { peer, pc } = setup();
     await expect(peer.handleRemoteOffer(OFFER)).rejects.toThrow(/not initialised/);
-    await peer.init();
+    await peer.init(TURN);
     const first = peer.handleRemoteOffer(OFFER);
     await expect(peer.handleRemoteOffer(OFFER)).rejects.toThrow(/already handling/);
     pc().fireLocalAnswer(ANSWER);

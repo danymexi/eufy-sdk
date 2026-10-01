@@ -1,58 +1,41 @@
 /**
- * The T9000's signalling channel — the WebSocket through which a client and a HomeBase S1 Pro agree on
- * a WebRTC session. This is the wire security.eufy.com's web client uses (`/v1/rtc/ws/join`), which the
- * hub accepts from any client that presents the account's mega token, so it needs nothing the SDK does
- * not already hold after login.
+ * The T9000's signalling channel: the WebSocket through which a client and a HomeBase S1 Pro agree on a
+ * WebRTC session. It is the wire the security.eufy.com web client uses (`/v1/rtc/ws/join`), and the hub
+ * accepts it from any client presenting the account's mega token.
  *
- * Sequence, as reversed from the portal and confirmed live on US and FR hubs
- * (genomez/eufy-security-client, MIT):
+ * Sequence (wire reversed by genomez/eufy-security-client, MIT):
  *
  *   1. `GET https://<smart host>/v1/smart/nvr/ws/sign` with the mega token → a `sign` blob.
  *   2. WebSocket to `wss://<smart host>/v1/rtc/ws/join?reqtype=nvr`, subprotocols `["v1", <base64url
- *      JSON>]` carrying region, station serial, token, `gtoken` (md5 of the ACCOUNT user_id, not the ap_cloud one) and the sign. HTTP
- *      headers on the upgrade alone are refused — the JSON subprotocol is what authenticates.
+ *      JSON>]` carrying the cluster region, station serial, token, `gtoken` and the sign. HTTP headers on
+ *      the upgrade alone are refused: the JSON subprotocol is what authenticates.
  *   3. `action 1` auth on open; `action 3` session messages after: `scall` (start), `info` (SDP and
  *      trickle ICE), `ack`, `hangup`. Every session message carries an HMAC-SHA256 `account` over
  *      `channelId + adminUserId + ts`, keyed by the token.
  *
- * Region is two different things and the portal sends both: the HTTP sign request names the account's
- * **country** (`Web-Country: FR`), the WebSocket payload names the **cluster** (`region: "EU"`). Sending
- * the country in the cluster slot authenticates the sign and then fails the socket — that is exactly the
- * mismatch that cost an FR tester ten builds, so the two are separate options here and both derive from
- * the mega session's shard by default.
+ * Region is two values: the HTTP sign request names the account's **country** (`Web-Country`), the
+ * WebSocket payload names the **cluster**, which is the shard prefix uppercased (`ie-pr` → `IE`). A
+ * country in the cluster slot authenticates the sign and then fails the socket.
  *
- * `fetch` and the `WebSocket` constructor are injectable so the whole exchange is testable offline.
+ * `fetch` and the `WebSocket` constructor are injectable.
  */
 
 import { EventEmitter } from "node:events";
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { noopLogger, type Logger } from "../../core/logger.js";
 
-export type RtcRegionShard = "eu-pr" | "ie-pr" | "us-pr";
-
-/** The signalling host per mega shard — the global one serves US, EU accounts have their own. */
-export const SMART_HOST_BY_SHARD: Readonly<Record<RtcRegionShard, string>> = {
-  "us-pr": "security-smart.eufylife.com",
-  "eu-pr": "security-smart-eu.eufylife.com",
-  // Ireland has its OWN smart host, not the eu one — verified 200/bizcode 0 on a live CH account.
-  "ie-pr": "security-smart-ie.eufylife.com",
-};
-
 /**
- * The smart host for a shard, deriving `security-smart-<prefix>` for any shard not in the table (us is
- * the bare host). So a shard we have not seen still gets its regional host instead of failing.
+ * The signalling host for a mega shard: the bare `security-smart` host for `us`, else
+ * `security-smart-<prefix>` (`eu-pr` → `security-smart-eu`, `ie-pr` → `security-smart-ie`).
  */
 export function smartHostForShard(shard: string): string {
-  if (shard in SMART_HOST_BY_SHARD) return SMART_HOST_BY_SHARD[shard as RtcRegionShard];
   const prefix = shard.split("-")[0]?.toLowerCase();
   return !prefix || prefix === "us" ? "security-smart.eufylife.com" : `security-smart-${prefix}.eufylife.com`;
 }
 
-/** The cluster name the WebSocket payload wants per shard. */
 /**
- * The cluster name the WebSocket subprotocol payload wants: the shard prefix uppercased. Verified
- * live — an `ie-pr` account gets WS 101 with `"IE"` and 400 with `"EU"`, so this is NOT an EU-family
- * grouping, it is the shard's own region letter (us-pr → US, eu-pr → EU, ie-pr → IE).
+ * The cluster name the WebSocket subprotocol payload carries: the shard prefix uppercased (us-pr → US,
+ * eu-pr → EU, ie-pr → IE). An `ie-pr` account is answered 101 with `"IE"` and 400 with `"EU"`.
  */
 export function wsRegionForShard(shard: string): string {
   return (shard.split("-")[0] || "us").toUpperCase();
@@ -60,10 +43,14 @@ export function wsRegionForShard(shard: string): string {
 
 export const RTC_WS_PATH = "/v1/rtc/ws/join?reqtype=nvr";
 export const RTC_SIGN_PATH = "/v1/smart/nvr/ws/sign";
-/** The portal's origin; the sign endpoint checks it. */
+/** The portal's origin; the sign endpoint and the socket upgrade both check it. */
 export const PORTAL_ORIGIN = "https://security.eufy.com";
-/** The hub drops an idle signalling socket after ~83 s; the portal re-sends auth well inside that. */
+/** The hub drops an idle signalling socket after ~83 s; re-sending auth inside that keeps it. */
 export const SIGNALING_KEEPALIVE_MS = 25_000;
+/** How long the socket has to open after the sign. */
+export const SIGNALING_CONNECT_TIMEOUT_MS = 15_000;
+/** The `source` every message carries, as the portal sends it. */
+const SOURCE = "WEB";
 
 /** Outer wire envelope. */
 export interface RtcWsEnvelope {
@@ -87,14 +74,14 @@ export interface RtcInnerMessage {
   msgid?: string;
 }
 
-/** The subset of a browser/undici `WebSocket` the client uses — what a test doubles. */
-/** What a socket event carries; only the fields each event type actually fills are read. */
+/** What a socket event carries; only the fields each event type fills are read. */
 export interface SignalingSocketEvent {
   data?: unknown;
   code?: number;
   reason?: string;
 }
 
+/** The subset of a `WebSocket` the client uses. */
 export interface SignalingSocket {
   readonly readyState: number;
   send(data: string): void;
@@ -105,7 +92,7 @@ export interface SignalingSocket {
 export interface SignalingSocketInit {
   /** The subprotocols; slot 2 carries the base64url auth JSON. */
   protocols: string[];
-  /** The upgrade Origin — the portal sends it and the server checks it, like the sign call. */
+  /** The upgrade Origin, which the server checks like the sign call. */
   origin: string;
 }
 export type SignalingSocketFactory = (url: string, init: SignalingSocketInit) => SignalingSocket;
@@ -113,37 +100,15 @@ export type SignalingSocketFactory = (url: string, init: SignalingSocketInit) =>
 export interface RtcSignalingOptions {
   /** The mega session's auth token. */
   authToken: string;
-  /**
-   * The mega session's user id — the `ap_cloud_user_id` the scall `account` HMAC and `subSn` path use.
-   * NOTE: this is NOT necessarily the id `gtoken` hashes — see `gtoken` / `accountUserId`.
-   */
-  userId: string;
-  /**
-   * The eufy ACCOUNT user_id, whose md5 is the `gtoken` the portal sends. On accounts where the login
-   * reply carries a separate `ap_cloud_user_id`, this differs from {@link userId}, and hashing the wrong
-   * one is a silent sign rejection. Defaults to {@link userId}; overridden by an explicit {@link gtoken}.
-   */
-  accountUserId?: string;
-  /** The gtoken to send verbatim, when it is known directly (e.g. read from a live session). */
-  gtoken?: string;
+  /** The `gtoken` header value the mega session's authed HTTP calls carry. */
+  gtoken: string;
   stationSn: string;
-  /**
-   * The camera the session is for, when it is a per-camera (live) session rather than the hub's own —
-   * the portal sends it on every session message as `subSn`, empty for the hub.
-   */
-  subSn?: string;
   /** The station's `member.admin_user_id`, the account the session HMAC names. */
   adminUserId: string;
   /** The mega shard the account lives on; picks the host and the cluster name. */
-  shard: RtcRegionShard;
+  shard: string;
   /** The account's ISO country, sent on the sign request (`Web-Country`). */
   country: string;
-  /** Overrides for the shard-derived defaults. */
-  smartHost?: string;
-  wsRegion?: string;
-  /** `WEB` (the portal) or `APP`; the hub accepts both. */
-  source?: string;
-  connectTimeoutMs?: number;
   fetch?: typeof fetch;
   createSocket?: SignalingSocketFactory;
   logger?: Logger;
@@ -158,7 +123,7 @@ export interface RtcSignalingEvents {
   error: [err: Error];
 }
 
-/** Raised when the sign endpoint refuses the token; the caller decides whether to re-login. */
+/** Raised when the sign endpoint refuses the token. */
 export class RtcSignError extends Error {
   constructor(
     message: string,
@@ -168,24 +133,6 @@ export class RtcSignError extends Error {
     super(message);
     this.name = "RtcSignError";
   }
-
-  /** A 401 whose text says the token is gone — the portal's own wording for a revoked mega session. */
-  get tokenRevoked(): boolean {
-    const text = this.message.toLowerCase();
-    return this.httpStatus === 401 && text.includes("token") && /not exist|does not exist|kicked out/.test(text);
-  }
-}
-
-export function gtokenFromUserId(userId: string): string {
-  return createHash("md5").update(userId).digest("hex");
-}
-
-export function base64urlJson(obj: Record<string, unknown>): string {
-  return Buffer.from(JSON.stringify(obj), "utf8")
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
 }
 
 /** The portal's `account` field: HMAC-SHA256 of `channelId + adminUserId + ts`, keyed by the token. */
@@ -195,14 +142,21 @@ export function sessionAccount(channelId: number, adminUserId: string, ts: numbe
 
 const WS_OPEN = 1;
 
+/**
+ * Node's global WebSocket (undici) takes an options object with `headers`. Unlike a browser it sends no
+ * Origin of its own, and the smart host rejects an upgrade without one.
+ */
+const defaultSocket: SignalingSocketFactory = (url, init) =>
+  new WebSocket(url, {
+    protocols: init.protocols,
+    headers: { Origin: init.origin },
+  } as unknown as string[]) as unknown as SignalingSocket;
+
 export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
   private ws?: SignalingSocket;
   private sign?: string;
   private keepalive?: NodeJS.Timeout;
   private readonly smartHost: string;
-  private readonly wsRegion: string;
-  private readonly source: string;
-  private readonly gtoken: string;
   private readonly fetchImpl: typeof fetch;
   private readonly createSocket: SignalingSocketFactory;
   private readonly logger: Logger;
@@ -211,20 +165,9 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
 
   constructor(private readonly opts: RtcSignalingOptions) {
     super();
-    this.smartHost = opts.smartHost ?? smartHostForShard(opts.shard);
-    this.wsRegion = opts.wsRegion ?? wsRegionForShard(opts.shard);
-    this.source = opts.source ?? "WEB";
-    this.gtoken = opts.gtoken ?? gtokenFromUserId(opts.accountUserId ?? opts.userId);
+    this.smartHost = smartHostForShard(opts.shard);
     this.fetchImpl = opts.fetch ?? fetch;
-    this.createSocket =
-      opts.createSocket ??
-      ((url, init) =>
-        // Node's global WebSocket (undici) takes an options object with `headers`; browsers send Origin
-        // for us, Node does not, and the smart host rejects the upgrade without it.
-        new WebSocket(url, {
-          protocols: init.protocols,
-          headers: { Origin: init.origin },
-        } as unknown as string[]) as unknown as SignalingSocket);
+    this.createSocket = opts.createSocket ?? defaultSocket;
     this.logger = opts.logger ?? noopLogger;
     this.now = opts.now ?? Date.now;
     this.makeMsgId = opts.makeMsgId ?? (() => randomUUID().replace(/-/g, ""));
@@ -242,7 +185,7 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     return this.ws?.readyState === WS_OPEN;
   }
 
-  /** Step 1 — the sign blob the socket and every auth message carry. */
+  /** Step 1: the sign blob the socket and every auth message carry. A non-JSON body is reported by status. */
   async fetchSign(): Promise<string> {
     const res = await this.fetchImpl(this.signUrl, {
       headers: {
@@ -250,16 +193,11 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
         "X-Auth-Token": this.opts.authToken,
         "App-Name": "eufy_mega",
         "Model-Type": "WEB",
-        GToken: this.gtoken,
+        GToken: this.opts.gtoken,
         Origin: PORTAL_ORIGIN,
       },
     });
-    let body: { code?: number; data?: string; msg?: string } = {};
-    try {
-      body = (await res.json()) as typeof body;
-    } catch {
-      /* a non-JSON body is reported through the status below */
-    }
+    const body = ((await res.json().catch(() => ({}))) ?? {}) as { code?: number; data?: string; msg?: string };
     if (!res.ok || body.code !== 0 || !body.data) {
       throw new RtcSignError(
         `RTC sign for ${this.opts.stationSn} refused: HTTP ${res.status} ${body.msg ?? ""}`.trim(),
@@ -271,36 +209,36 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     return body.data;
   }
 
-  /** The base64url JSON that authenticates the socket (subprotocol slot 2). */
+  /** The JSON that authenticates the socket (subprotocol slot 2, base64url-encoded on the wire). */
   subprotocolPayload(sign: string): Record<string, unknown> {
     return {
-      region: this.wsRegion,
+      region: wsRegionForShard(this.opts.shard),
       type: "NVR",
       sn: this.opts.stationSn,
       token: this.opts.authToken,
-      gtoken: this.gtoken,
+      gtoken: this.opts.gtoken,
       sign,
       appName: "eufy_mega",
       modelType: "WEB",
     };
   }
 
-  /** Step 2 — open the socket and send the first auth; resolves on `open`. */
+  /**
+   * Step 2: open the socket and send the first auth; resolves on `open`. A socket that closes or errors
+   * before it ever opened rejects, so the call always settles.
+   */
   async connect(): Promise<void> {
     if (this.ws) return;
     const sign = this.sign ?? (await this.fetchSign());
-    const protocols = ["v1", base64urlJson(this.subprotocolPayload(sign))];
-    const timeoutMs = this.opts.connectTimeoutMs ?? 15_000;
+    const protocols = ["v1", Buffer.from(JSON.stringify(this.subprotocolPayload(sign))).toString("base64url")];
     this.logger.debug(`[rtc] ${this.opts.stationSn} signalling connect ${this.wsUrl}`);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
-        reject(new Error(`RTC signalling connect timeout after ${timeoutMs}ms`));
+        reject(new Error(`RTC signalling connect timeout after ${SIGNALING_CONNECT_TIMEOUT_MS}ms`));
         this.close();
-      }, timeoutMs);
+      }, SIGNALING_CONNECT_TIMEOUT_MS);
       const ws = this.createSocket(this.wsUrl, { protocols, origin: PORTAL_ORIGIN });
       this.ws = ws;
-      // A socket that closes or errors before it ever opened has to SETTLE connect(); clearing the
-      // timer alone would leave the caller awaiting a promise nothing can resolve.
       let opened = false;
       ws.addEventListener("open", () => {
         opened = true;
@@ -332,7 +270,7 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     });
   }
 
-  /** `action 1` — also what keeps the socket alive when re-sent. */
+  /** `action 1`, also what keeps the socket alive when re-sent. */
   sendAuth(sign?: string): void {
     const s = sign ?? this.sign;
     if (!s) throw new Error("RTC signalling: no sign to authenticate with");
@@ -341,12 +279,12 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
       action: 1,
       data: s,
       sn: this.opts.stationSn,
-      source: this.source,
+      source: SOURCE,
       ts: Math.floor(this.now() / 1000),
     });
   }
 
-  /** `action 3` — a session message; `scall` opens the negotiation. */
+  /** `action 3`, a session message; `scall` opens the negotiation. `subSn` is empty for the hub's session. */
   sendSession(dataType: string, payload: Record<string, unknown> = {}, channelId = 0): void {
     const ts = Math.floor(this.now() / 1000);
     const inner = {
@@ -354,11 +292,11 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
       action: 3,
       sessionId: this.sign,
       sn: this.opts.stationSn,
-      subSn: this.opts.subSn ?? "",
+      subSn: "",
       channelId,
       isResponse: 0,
       dataType,
-      source: this.source,
+      source: SOURCE,
       ts,
       data: JSON.stringify({
         timestamp: ts,
@@ -377,15 +315,14 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     this.sendSession("ack", {}, channelId);
   }
 
-  /** SDP (as scall JSON text) rides channel 0 in an `info`. */
+  /** The SDP answer, as scall JSON text, in an `info`. */
   sendInfoSdp(scallJson: string, channelId = 0): void {
     this.sendSession("info", { sdp: scallJson }, channelId);
   }
 
   /**
-   * Trickle a candidate on the session's own channel — the portal sends every candidate on the same
-   * channelId as its SDP answer, not on a fixed channel. The default is the command channel; callers
-   * with a non-zero session pass their own. An empty candidate is end-of-candidates.
+   * Trickle a candidate on the session's own channel, the same channel as its SDP answer. An empty
+   * candidate is end-of-candidates.
    */
   sendInfoCandidate(candidate: string, channelId = 0): void {
     this.sendSession("info", { candidate }, channelId);

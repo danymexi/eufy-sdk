@@ -7,5 +7,4 @@ export * from "./http/index.js";
 export * from "./mqtt/index.js";
 export * from "./p2p/index.js";
 export * from "./push/index.js";
-export * from "./rtc/index.js";
 export * as tuya from "./tuya/index.js";
