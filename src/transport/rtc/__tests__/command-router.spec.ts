@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { RtcCommandRouter, type RtcCommandRouterDeps, type RtcRoute } from "../command-router.js";
+import { RtcCommandRouter, type RtcCommandRouterDeps, type RtcLiveRoute, type RtcRoute } from "../command-router.js";
 import type { RtcSession, RtcSessionOptions } from "../session.js";
 import { buildPortalHeader, parsePortalHeader, PortalLinkType, PORTAL_HEADER_LENGTH } from "../portal-packet.js";
 
@@ -60,6 +60,9 @@ class FakeSession extends EventEmitter {
       Buffer.concat([buildPortalHeader(commandId, body.length, PORTAL_STATION_CHANNEL, segment, 1), body]),
       linkType,
     );
+  }
+  sendRaw(): boolean {
+    return this.isConnected;
   }
   sendCommand(pkt: Buffer): boolean {
     if (!this.isConnected) return false;
@@ -369,5 +372,74 @@ describe("RtcCommandRouter", () => {
     const { router: out } = makeRouter({ identity: () => undefined });
     await expect(out.dispatchCommand(ST, arming(1))).rejects.toThrow(/not logged in/);
     vi.restoreAllMocks();
+  });
+});
+
+describe("RtcCommandRouter live view", () => {
+  const cam = (cameraSn: string, channel: number): RtcLiveRoute => ({ ...CAM, cameraSn, channel });
+  const ORTO = cam("T8000P0000000002", 2);
+  const PORCH = cam("T8000P0000000003", 3);
+  /** The live starts (inner cmd 1003) a session carried. */
+  const starts = (s: FakeSession) => s.sent.map(sent).filter((p) => p.body.cmd === 1003);
+
+  it("shares one pull between concurrent viewers of the same camera", async () => {
+    const { router, sessions } = makeRouter();
+    try {
+      const media = router.mediaProviderFor(ORTO);
+      const [a, b] = await Promise.all([media.live(), media.live()]);
+      expect(sessions).toHaveLength(1);
+      expect(starts(sessions[0]!)).toHaveLength(1);
+      a.stop();
+      b.stop();
+    } finally {
+      router.close();
+    }
+  });
+
+  it("refuses a second camera on the same station while the first one's view is up", async () => {
+    const { router } = makeRouter();
+    try {
+      const viewer = await router.mediaProviderFor(ORTO).live();
+      await expect(router.mediaProviderFor(PORCH).live()).rejects.toThrow(/streams one camera at a time/);
+      viewer.stop();
+    } finally {
+      router.close();
+    }
+  });
+
+  it("ends the viewers when the router closes, before the session goes", async () => {
+    const { router, sessions } = makeRouter();
+    const viewer = await router.mediaProviderFor(ORTO).live();
+    const stopped = vi.fn();
+    viewer.on("stop", stopped);
+    router.close();
+    await vi.waitFor(() => expect(stopped).toHaveBeenCalled());
+    expect(sessions[0]!.closed).toBe(true);
+  });
+
+  it("honours an abort that lands during the bring-up, and one that came before the call", async () => {
+    const { router } = makeRouter();
+    try {
+      const media = router.mediaProviderFor(ORTO);
+      const early = new AbortController();
+      early.abort(new Error("caller gave up"));
+      await expect(media.live({ signal: early.signal })).rejects.toThrow("caller gave up");
+      const late = new AbortController();
+      const pending = media.live({ signal: late.signal });
+      late.abort(new Error("caller left"));
+      await expect(pending).rejects.toThrow("caller left");
+    } finally {
+      router.close();
+    }
+  });
+
+  it("has no wire for recording and leaves the optional media members absent", async () => {
+    const { router } = makeRouter();
+    const media = router.mediaProviderFor(ORTO);
+    await expect(media.record(5)).rejects.toThrow(/record is not available/);
+    expect(media.recordFragments).toBeUndefined();
+    expect(media.talkback).toBeUndefined();
+    expect(media.p2pQuery).toBeUndefined();
+    expect(media.p2pControlQuery).toBeUndefined();
   });
 });
