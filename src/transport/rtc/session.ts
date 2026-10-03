@@ -4,18 +4,18 @@
  *
  * The signalling exchange, as the portal runs it and as confirmed live:
  *
- *   → scall                          (action 3, channel 0)
+ *   → scall                          (action 3, channel 0, the hub's own session)
  *   ← scall {status: 100, turn}      the hub granted the session and handed out TURN credentials
  *   ← info  {sdp | format:"SDP"}     the hub's offer, as scall JSON
- *   → info  {sdp}                    the answer, on the session's channel (0, the hub)
+ *   → info  {sdp}                    the answer
  *   ↔ info  {candidate}              trickle ICE on the same channel; "" ends it
  *   ← scall {status: 200}            → ack
- *   ← scall {status: 486 | 408}      busy / timeout — hang up, back off, call again (bounded)
+ *   ← scall {status: 486 | 408}      busy / timeout: the session fails
  *   ← hangup                         the hub ended it
  *
- * The command data channel is the session: `close` fires when it closes, or when the peer fails, even
- * while the peer connection is nominally up. `486`/`408` retries are bounded by {@link MAX_CALL_RETRIES}
- * and backed off 5 s more per retry, capped at 30 s.
+ * The command data channel is the session: `close` fires once, when the channel closes, the peer fails,
+ * the signalling socket drops or {@link RtcSession.close} is called, even while the peer connection is
+ * nominally up.
  *
  * Both the signalling client and the peer are injectable.
  */
@@ -23,26 +23,20 @@
 import { EventEmitter } from "node:events";
 import { noopLogger, type Logger } from "../../core/logger.js";
 import { RtcPeer, type RtcPeerOptions, type TurnConfig } from "./peer.js";
-import { scallJsonToSdp, toWireCandidate } from "./scall-sdp.js";
+import { scallJsonToSdp, sdpToScallJson, toWireCandidate } from "./scall-sdp.js";
 import { RtcSignalingClient, type RtcInnerMessage, type RtcSignalingOptions } from "./signaling.js";
 
 export interface RtcSessionOptions extends RtcSignalingOptions {
   peer?: RtcPeerOptions;
   createSignaling?: (opts: RtcSignalingOptions) => RtcSignalingClient;
   createPeer?: (opts: RtcPeerOptions) => RtcPeer;
-  sleep?: (ms: number) => Promise<void>;
 }
 
-/** The session channel: 0 addresses the hub itself. */
-const HUB_CHANNEL = 0;
 /** How long the signalling auth may take. */
 const AUTH_TIMEOUT_MS = 15_000;
-/** How many `486`/`408` retries before giving up. */
-export const MAX_CALL_RETRIES = 3;
 
 export interface RtcSessionEvents {
   connected: [];
-  turn: [turn: TurnConfig];
   close: [];
   error: [err: Error];
   /** A reassembled frame: portal packet bytes + the link type it arrived on. */
@@ -61,25 +55,22 @@ interface InfoPayload {
   sdp?: string;
 }
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
 export class RtcSession extends EventEmitter<RtcSessionEvents> {
   private readonly signaling: RtcSignalingClient;
   private readonly peer: RtcPeer;
   private readonly logger: Logger;
-  private readonly sleep: (ms: number) => Promise<void>;
   private turn?: TurnConfig;
   private authOk = false;
+  private authWaiter?: () => void;
   private connected = false;
   private closed = false;
+  private closeAnnounced = false;
   private sdpHandled = false;
-  private callRetries = 0;
   private chain: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: RtcSessionOptions) {
     super();
     this.logger = opts.logger ?? noopLogger;
-    this.sleep = opts.sleep ?? defaultSleep;
     this.signaling = (opts.createSignaling ?? ((o) => new RtcSignalingClient(o)))(opts);
     this.peer = (opts.createPeer ?? ((o) => new RtcPeer(o)))({ logger: this.logger, ...opts.peer });
 
@@ -91,14 +82,13 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
         });
     });
     this.signaling.on("close", () => {
-      if (this.closed) return;
       this.connected = false;
-      this.emit("close");
+      this.announceClose();
     });
     this.signaling.on("error", (e) => this.emit("error", e));
 
-    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c), HUB_CHANNEL));
-    this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate("", HUB_CHANNEL));
+    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c)));
+    this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate(""));
     this.peer.on("commandChannelOpen", () => {
       if (this.connected) return;
       this.connected = true;
@@ -106,19 +96,19 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       this.emit("connected");
     });
     this.peer.on("commandChannelClosed", () => {
-      if (!this.connected || this.closed) return;
+      if (!this.connected) return;
       this.connected = false;
       this.logger.debug(`[rtc] ${this.opts.stationSn} command channel closed`);
-      this.emit("close");
+      this.announceClose();
     });
     this.peer.on("connectionState", (state) => {
-      if ((state === "failed" || state === "closed") && this.connected && !this.closed) {
+      if ((state === "failed" || state === "closed") && this.connected) {
         this.connected = false;
-        this.emit("close");
+        this.announceClose();
       }
     });
     this.peer.on("error", (e) => this.emit("error", e));
-    this.peer.on("data", (_label, frame, linkType) => this.emit("commandData", frame, linkType));
+    this.peer.on("data", (frame, linkType) => this.emit("commandData", frame, linkType));
   }
 
   get isConnected(): boolean {
@@ -131,7 +121,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     await this.signaling.connect();
     await this.waitForAuth();
     this.logger.debug(`[rtc] ${this.opts.stationSn} authenticated — scall`);
-    this.signaling.sendCall(HUB_CHANNEL);
+    this.signaling.sendCall();
   }
 
   /** Send one portal packet; false when the command channel isn't open. */
@@ -139,41 +129,47 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     return this.peer.sendCommand(portalPacket);
   }
 
+  /** Hang up and tear both sides down; `close` fires once, here if nothing announced it before. */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.connected = false;
     try {
-      if (this.signaling.isOpen) this.signaling.sendHangup(HUB_CHANNEL);
+      if (this.signaling.isOpen) this.signaling.sendHangup();
     } catch {
       /* the socket may already be gone */
     }
     this.signaling.close();
     this.peer.close();
+    this.announceClose();
+  }
+
+  private announceClose(): void {
+    if (this.closeAnnounced) return;
+    this.closeAnnounced = true;
+    this.emit("close");
   }
 
   private waitForAuth(): Promise<void> {
     if (this.authOk) return Promise.resolve();
-    const timeoutMs = AUTH_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.signaling.off("message", onMsg);
+        this.authWaiter = undefined;
         reject(new Error("RTC signalling auth timeout"));
-      }, timeoutMs);
-      const onMsg = (inner: RtcInnerMessage): void => {
-        if (inner.action === 1 && inner.code === 200) {
-          this.authOk = true;
-          clearTimeout(timer);
-          this.signaling.off("message", onMsg);
-          resolve();
-        }
+      }, AUTH_TIMEOUT_MS);
+      this.authWaiter = () => {
+        clearTimeout(timer);
+        this.authWaiter = undefined;
+        resolve();
       };
-      this.signaling.on("message", onMsg);
     });
   }
 
   private async onSignaling(inner: RtcInnerMessage): Promise<void> {
-    if (inner.action === 1 && inner.code === 200) this.authOk = true;
+    if (inner.action === 1 && inner.code === 200) {
+      this.authOk = true;
+      this.authWaiter?.();
+    }
     if (!inner.data) return;
     let payload: Record<string, unknown>;
     try {
@@ -197,38 +193,22 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     }
   }
 
+  /** A `scall` status: `100` grants the relay, `200` is acknowledged, `486`/`408` fail the session. */
   private async onCall(payload: CallPayload): Promise<void> {
     if (this.closed) return;
     const status = payload.status;
     if (status === 100 && payload.turn) {
-      this.callRetries = 0;
       this.turn = payload.turn;
-      this.emit("turn", payload.turn);
       await this.peer.init(payload.turn);
       return;
     }
     if (status === 200) {
-      this.signaling.sendAck(HUB_CHANNEL);
+      this.signaling.sendAck();
       return;
     }
     if (status === 486 || status === 408) {
-      this.callRetries++;
-      this.logger.warn(`[rtc] ${this.opts.stationSn} scall ${status}, retry ${this.callRetries}`);
-      try {
-        this.signaling.sendHangup(HUB_CHANNEL);
-      } catch {
-        /* not fatal */
-      }
-      this.peer.close();
-      this.sdpHandled = false;
-      this.turn = undefined;
-      this.connected = false;
-      if (this.callRetries > MAX_CALL_RETRIES) {
-        this.emit("error", new Error(`RTC scall ${status} after ${this.callRetries - 1} retries`));
-        return;
-      }
-      await this.sleep(Math.min(5_000 + this.callRetries * 5_000, 30_000));
-      if (!this.closed) this.signaling.sendCall(HUB_CHANNEL);
+      this.emit("error", new Error(`RTC ${this.opts.stationSn} scall answered ${status}`));
+      this.close();
     }
   }
 
@@ -262,7 +242,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       offer = sdpText;
     }
     const answer = await this.peer.handleRemoteOffer(offer);
-    this.signaling.sendInfoSdp(this.peer.answerAsScallJson(answer), HUB_CHANNEL);
+    this.signaling.sendInfoSdp(JSON.stringify(sdpToScallJson(answer)));
     this.logger.debug(`[rtc] ${this.opts.stationSn} answered the hub's offer`);
   }
 }

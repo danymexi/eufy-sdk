@@ -16,8 +16,8 @@
  */
 
 import { EventEmitter } from "node:events";
+import type { DataChannel, IceServer, PeerConnection, RtcConfig } from "node-datachannel";
 import { noopLogger, type Logger } from "../../core/logger.js";
-import { PortalLinkType } from "./portal-packet.js";
 import { PtcsFramer } from "./ptcs-framer.js";
 import {
   ANKER_MAX_MESSAGE_SIZE,
@@ -25,7 +25,6 @@ import {
   forceDtlsRole,
   iceCandidateType,
   pinMaxMessageSize,
-  sdpToScallJson,
 } from "./scall-sdp.js";
 
 export interface TurnConfig {
@@ -37,48 +36,7 @@ export interface TurnConfig {
   alt_turn_port?: number;
 }
 
-/** The slice of `node-datachannel`'s `DataChannel` the peer uses. */
-export interface NativeDataChannel {
-  getLabel(): string;
-  isOpen(): boolean;
-  sendMessageBinary(buffer: Buffer | Uint8Array): boolean;
-  close(): void;
-  onOpen(cb: () => void): void;
-  onClosed(cb: () => void): void;
-  onError(cb: (err: string) => void): void;
-  onMessage(cb: (msg: string | Buffer | ArrayBuffer) => void): void;
-}
-
-/** The slice of `node-datachannel`'s `PeerConnection` the peer uses. */
-export interface NativePeerConnection {
-  close(): void;
-  setRemoteDescription(sdp: string, type: "offer" | "answer"): void;
-  localDescription(): { type: string; sdp: string } | null;
-  addRemoteCandidate(candidate: string, mid: string): void;
-  createDataChannel(label: string, config?: { id?: number; unordered?: boolean }): NativeDataChannel;
-  onLocalDescription(cb: (sdp: string, type: string) => void): void;
-  onLocalCandidate(cb: (candidate: string, mid: string) => void): void;
-  onStateChange(cb: (state: string) => void): void;
-  onGatheringStateChange(cb: (state: string) => void): void;
-  onDataChannel(cb: (dc: NativeDataChannel) => void): void;
-}
-
-export interface NativeIceServer {
-  hostname: string;
-  port: number;
-  username?: string;
-  password?: string;
-  relayType?: "TurnUdp" | "TurnTcp" | "TurnTls";
-}
-
-export interface NativePeerConfig {
-  iceServers: NativeIceServer[];
-  iceTransportPolicy: "all" | "relay";
-  maxMessageSize: number;
-  enableIceTcp: boolean;
-}
-
-export type NativePeerFactory = (name: string, config: NativePeerConfig) => NativePeerConnection;
+export type NativePeerFactory = (name: string, config: RtcConfig) => PeerConnection;
 
 export interface RtcPeerOptions {
   createPeer?: NativePeerFactory;
@@ -89,7 +47,7 @@ export interface RtcPeerEvents {
   commandChannelOpen: [];
   /** The command channel went away while the peer itself may still be up. */
   commandChannelClosed: [];
-  data: [label: string, frame: Buffer, linkType: number];
+  data: [frame: Buffer, linkType: number];
   iceCandidate: [candidate: string];
   iceGatheringComplete: [];
   connectionState: [state: string];
@@ -100,21 +58,6 @@ export interface RtcPeerEvents {
 export const DATA_CHANNEL_LABELS = ["WebrtcDataChannel", "audio", "idr", "video", "notify", "download"] as const;
 export const COMMAND_CHANNEL = DATA_CHANNEL_LABELS[0];
 
-/** Which logical channel a reassembled frame belongs to, named after the portal's data channels. */
-export function labelForLinkType(linkType: number): string {
-  switch (linkType) {
-    case PortalLinkType.NOTIFY:
-      return "notify";
-    case PortalLinkType.LIVE:
-      return "video";
-    case PortalLinkType.FILE:
-      return "download";
-    case PortalLinkType.PLAYBACK:
-      return "playback";
-    default:
-      return COMMAND_CHANNEL;
-  }
-}
 /**
  * The SCTP stream ids the portal assigns: `WebrtcDataChannel` is id 0 and the rest follow in channel
  * order. Even ids are the DTLS client's half under RFC 8832, which is why the peer answers `active`.
@@ -128,8 +71,8 @@ const DATA_CHANNEL_IDS: Record<string, number> = {
   download: 10,
 };
 
-function turnServers(turn: TurnConfig): NativeIceServer[] {
-  const both = (hostname: string, port: number): NativeIceServer[] => [
+function turnServers(turn: TurnConfig): IceServer[] {
+  const both = (hostname: string, port: number): IceServer[] => [
     { hostname, port, username: turn.turn_user, password: turn.turn_password, relayType: "TurnUdp" },
     { hostname, port, username: turn.turn_user, password: turn.turn_password, relayType: "TurnTcp" },
   ];
@@ -138,34 +81,37 @@ function turnServers(turn: TurnConfig): NativeIceServer[] {
   return servers;
 }
 
+/** The architectures `node-datachannel` ships no prebuilt binary for: 32-bit ARM and x86. */
+const UNBUILT_ARCHES: ReadonlySet<string> = new Set(["arm", "ia32"]);
+
 /**
- * `node-datachannel` is an optional dependency: only a T9000 station needs the WebRTC transport. It is
- * loaded on the first session, and a missing module fails with an install hint rather than a bare
- * module-not-found.
+ * `node-datachannel` is an optional peer dependency: only a T9000 station needs the WebRTC transport.
+ * It is loaded on the first session. A missing module fails with an install hint, or, on an
+ * architecture it has no build for, with the 64-bit requirement, since installing it there cannot help.
  */
 async function loadNativePeerFactory(): Promise<NativePeerFactory> {
   let ndc: typeof import("node-datachannel");
   try {
     ndc = await import("node-datachannel");
   } catch (err) {
-    throw new Error(
-      "the WebRTC transport for a HomeBase S1 Pro (T9000) needs the optional 'node-datachannel' package — " +
-        "install it to drive a T9000 over RTC (`npm install node-datachannel`)",
-      { cause: err },
-    );
+    const message = UNBUILT_ARCHES.has(process.arch)
+      ? `the WebRTC transport for a HomeBase S1 Pro (T9000) needs 'node-datachannel', which has no build for ` +
+        `${process.arch}; a 64-bit OS is needed to drive a T9000`
+      : "the WebRTC transport for a HomeBase S1 Pro (T9000) needs the optional peer dependency " +
+        "'node-datachannel' (`npm install node-datachannel`)";
+    throw new Error(message, { cause: err });
   }
-  return (name, config) => new ndc.PeerConnection(name, config as never) as unknown as NativePeerConnection;
+  return (name, config) => new ndc.PeerConnection(name, config);
 }
 
 /** How long the native peer has to produce the local answer. */
 const ANSWER_TIMEOUT_MS = 15_000;
 
 export class RtcPeer extends EventEmitter<RtcPeerEvents> {
-  private pc?: NativePeerConnection;
-  private readonly channels = new Map<string, NativeDataChannel>();
+  private pc?: PeerConnection;
+  private readonly channels = new Map<string, DataChannel>();
   private framer?: PtcsFramer;
   private readonly wireTally = new Map<string, number>();
-  private framerInit?: Promise<void>;
   private commandOpen = false;
   private remoteSet = false;
   private handlingOffer = false;
@@ -186,7 +132,7 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
   async init(turn: TurnConfig): Promise<void> {
     if (this.pc) return;
     const createPeer = this.opts.createPeer ?? (await loadNativePeerFactory());
-    const config: NativePeerConfig = {
+    const config: RtcConfig = {
       iceServers: turnServers(turn),
       iceTransportPolicy: "relay",
       maxMessageSize: ANKER_MAX_MESSAGE_SIZE,
@@ -260,11 +206,6 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     }
   }
 
-  /** Our answer, in the JSON shape the hub parses (`info` with `sdp`). */
-  answerAsScallJson(answerSdp: string): string {
-    return JSON.stringify(sdpToScallJson(answerSdp));
-  }
-
   addRemoteCandidate(candidate: string): void {
     if (!this.pc) return;
     if (!this.acceptsCandidate(candidate)) return;
@@ -273,11 +214,6 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
       return;
     }
     this.addNow(candidate);
-  }
-
-  get isCommandChannelReady(): boolean {
-    const dc = this.channels.get(COMMAND_CHANNEL);
-    return this.commandOpen && !!dc?.isOpen();
   }
 
   /**
@@ -301,7 +237,6 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
   close(): void {
     this.framer?.destroy();
     this.framer = undefined;
-    this.framerInit = undefined;
     if (this.localAnswer) {
       clearTimeout(this.localAnswer.timer);
       const pending = this.localAnswer;
@@ -331,22 +266,28 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
     }
   }
 
-  private wireChannel(label: string, dc: NativeDataChannel): void {
+  /**
+   * Wire one data channel. Every channel feeds the framer once the command channel has opened it; a
+   * message before that has nothing to reassemble into and is dropped.
+   */
+  private wireChannel(label: string, dc: DataChannel): void {
     if (this.channels.has(label)) return;
     this.channels.set(label, dc);
     dc.onOpen(() => {
       this.logger.debug(`[rtc] data channel open ${label}`);
       if (label !== COMMAND_CHANNEL) return;
-      void this.initFramer(dc)
-        .then(() => {
-          if (!this.pc || !dc.isOpen() || !this.framer?.isReady()) return;
-          this.commandOpen = true;
-          this.emit("commandChannelOpen");
-        })
-        .catch((e: unknown) => {
-          if (!this.pc || !dc.isOpen()) return;
-          this.emit("error", e instanceof Error ? e : new Error(String(e)));
-        });
+      if (!this.framer) {
+        const framer = new PtcsFramer();
+        framer.init(
+          (packet) => {
+            if (!dc.isOpen() || !dc.sendMessageBinary(packet)) this.wireSendFailed = true;
+          },
+          (frame, linkType) => this.emit("data", frame, linkType),
+        );
+        this.framer = framer;
+      }
+      this.commandOpen = true;
+      this.emit("commandChannelOpen");
     });
     dc.onClosed(() => {
       this.logger.debug(`[rtc] data channel closed ${label}`);
@@ -363,34 +304,8 @@ export class RtcPeer extends EventEmitter<RtcPeerEvents> {
       if (n <= 3 || n % 100 === 0) {
         this.logger.debug(`[rtc] wire ${label} #${n} ${buf.length}B ${buf.subarray(0, 8).toString("hex")}`);
       }
-      if (this.framer?.isReady()) {
-        this.framer.recvPacket(buf);
-        return;
-      }
-      this.emit("data", label, buf, 0);
+      this.framer?.recvPacket(buf);
     });
-  }
-
-  private initFramer(dc: NativeDataChannel): Promise<void> {
-    if (this.framerInit) return this.framerInit;
-    const framer = new PtcsFramer();
-    this.framer = framer;
-    this.framerInit = framer
-      .init(
-        (packet) => {
-          if (!dc.isOpen() || !dc.sendMessageBinary(packet)) this.wireSendFailed = true;
-        },
-        (frame, linkType) => this.emit("data", labelForLinkType(linkType), frame, linkType),
-      )
-      .catch((e: unknown) => {
-        if (this.framer === framer) {
-          framer.destroy();
-          this.framer = undefined;
-          this.framerInit = undefined;
-        }
-        throw e;
-      });
-    return this.framerInit;
   }
 
   private addNow(candidate: string): void {

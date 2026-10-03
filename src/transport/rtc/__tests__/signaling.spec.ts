@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { createHmac } from "node:crypto";
 import {
   PORTAL_ORIGIN,
-  RtcSignError,
   RtcSignalingClient,
   sessionAccount,
   type RtcSignalingOptions,
@@ -94,38 +93,40 @@ function client(overrides: Partial<RtcSignalingOptions> = {}) {
   return { c, sockets };
 }
 
+/** What the client signs at and connects to, and the auth JSON it puts in the subprotocol. */
+async function wire(overrides: Partial<RtcSignalingOptions> = {}) {
+  const fetchImpl = okSign("S");
+  const { c, sockets } = client({ fetch: fetchImpl, ...overrides });
+  const s = await opened(c, sockets);
+  const signUrl = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0] as string;
+  const auth = JSON.parse(Buffer.from(s.protocols[1]!, "base64url").toString("utf8")) as Record<string, unknown>;
+  return { signUrl, wsUrl: s.url, auth, headers: (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![1] };
+}
+
 describe("region rules", () => {
   it("derives host and cluster from the mega shard, and sends the country only on the sign request", async () => {
-    const { c } = client();
-    expect(c.signUrl).toBe("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign");
-    expect(c.wsUrl).toBe("wss://security-smart-eu.eufylife.com/v1/rtc/ws/join?reqtype=nvr");
-    expect(c.subprotocolPayload("S").region).toBe("EU");
-    const us = client({ shard: "us-pr", country: "US" }).c;
-    expect(us.signUrl).toContain("security-smart.eufylife.com");
-    expect(us.subprotocolPayload("S").region).toBe("US");
+    const eu = await wire();
+    expect(eu.signUrl).toBe("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign");
+    expect(eu.wsUrl).toBe("wss://security-smart-eu.eufylife.com/v1/rtc/ws/join?reqtype=nvr");
+    expect(eu.auth.region).toBe("EU");
+    const us = await wire({ shard: "us-pr", country: "US" });
+    expect(us.signUrl).toContain("//security-smart.eufylife.com/");
+    expect(us.auth.region).toBe("US");
   });
 
-  it("serves the ie-pr (Ireland/CH) shard from its own smart host with cluster IE", () => {
-    const ie = client({ shard: "ie-pr", country: "CH" }).c;
+  it("serves the ie-pr shard from its own smart host with cluster IE, and any other prefix alike", async () => {
+    const ie = await wire({ shard: "ie-pr", country: "CH" });
     expect(ie.signUrl).toBe("https://security-smart-ie.eufylife.com/v1/smart/nvr/ws/sign");
-    expect(ie.subprotocolPayload("S").region).toBe("IE");
-  });
-
-  it("derives a regional smart host + cluster for any other shard prefix", () => {
-    const de = client({ shard: "de-pr", country: "DE" }).c;
+    expect(ie.auth.region).toBe("IE");
+    const de = await wire({ shard: "de-pr", country: "DE" });
     expect(de.signUrl).toBe("https://security-smart-de.eufylife.com/v1/smart/nvr/ws/sign");
-    expect(de.subprotocolPayload("S").region).toBe("DE");
-    const us2 = client({ shard: "us-2", country: "US" }).c;
-    expect(us2.signUrl).toContain("security-smart.eufylife.com");
-    expect(us2.subprotocolPayload("S").region).toBe("US");
+    expect(de.auth.region).toBe("DE");
   });
 
   it("sends the session's gtoken verbatim on the sign and in the socket payload", async () => {
-    const { c } = client({ gtoken: "VERBATIM" });
-    const fetchImpl = c["fetchImpl"] as ReturnType<typeof vi.fn>;
-    await c.fetchSign();
-    expect((fetchImpl.mock.calls[0][1] as RequestInit).headers).toMatchObject({ GToken: "VERBATIM" });
-    expect(c.subprotocolPayload("S").gtoken).toBe("VERBATIM");
+    const w = await wire({ gtoken: "VERBATIM" });
+    expect((w.headers as RequestInit).headers).toMatchObject({ GToken: "VERBATIM" });
+    expect(w.auth.gtoken).toBe("VERBATIM");
   });
 
   it("sends the portal's sign headers exactly", async () => {
@@ -133,7 +134,7 @@ describe("region rules", () => {
     const { c } = client({ fetch: fetchImpl });
     await c.fetchSign();
     const [url, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(c.signUrl);
+    expect(url).toBe("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign");
     expect(init.headers).toEqual({
       "Web-Country": "IT",
       "X-Auth-Token": "TOKEN",
@@ -144,17 +145,14 @@ describe("region rules", () => {
     });
   });
 
-  it("types a refused sign with its HTTP status and API code", async () => {
+  it("reports a refused sign with its HTTP status and API code", async () => {
     const refused = vi.fn(async () => ({
       ok: false,
       status: 401,
       json: async () => ({ code: 26000, msg: "token not exist" }),
     })) as unknown as typeof fetch;
     const { c } = client({ fetch: refused });
-    const err = await c.fetchSign().catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(RtcSignError);
-    expect((err as RtcSignError).httpStatus).toBe(401);
-    expect((err as RtcSignError).apiCode).toBe(26000);
+    await expect(c.fetchSign()).rejects.toThrow("refused: HTTP 401 code 26000 token not exist");
   });
 });
 
@@ -163,11 +161,18 @@ describe("socket handshake", () => {
     const { c, sockets } = client();
     const connecting = c.connect();
     const s = await socketOf(sockets);
-    expect(s.url).toBe(c.wsUrl);
+    expect(s.url).toBe("wss://security-smart-eu.eufylife.com/v1/rtc/ws/join?reqtype=nvr");
     expect(s.protocols[0]).toBe("v1");
-    expect(JSON.parse(Buffer.from(s.protocols[1]!, "base64url").toString("utf8"))).toEqual(
-      c.subprotocolPayload("SIGNBLOB"),
-    );
+    expect(JSON.parse(Buffer.from(s.protocols[1]!, "base64url").toString("utf8"))).toEqual({
+      region: "EU",
+      type: "NVR",
+      sn: "T9000P0000000001",
+      token: "TOKEN",
+      gtoken: "GTOKEN",
+      sign: "SIGNBLOB",
+      appName: "eufy_mega",
+      modelType: "WEB",
+    });
     expect(s.protocols[1]).not.toMatch(/[+/=]/);
     expect(s.origin).toBe("https://security.eufy.com");
     s.open();
@@ -190,9 +195,9 @@ describe("socket handshake", () => {
   it("signs every session message with the portal's HMAC and a token-prefixed msgid", async () => {
     const { c, sockets } = client();
     const s = await opened(c, sockets);
-    c.sendCall(0);
-    c.sendInfoSdp('{"setup":"passive"}', 0);
-    c.sendInfoCandidate("", 1);
+    c.sendCall();
+    c.sendInfoSdp('{"setup":"passive"}');
+    c.sendInfoCandidate("");
     const [, call, sdp, eoc] = s.sent.map((m) => JSON.parse(m) as { msgid: string; data: string });
     expect(call!.msgid).toBe("TOKEN_deadbeef");
     const inner = JSON.parse(call!.data) as Record<string, unknown>;
@@ -214,7 +219,7 @@ describe("socket handshake", () => {
     expect(data.account).toBe(sessionAccount(0, "admin-1", 1_790_000_000, "TOKEN"));
     expect(JSON.parse((JSON.parse(sdp!.data) as { data: string }).data)).toMatchObject({ sdp: '{"setup":"passive"}' });
     const eocInner = JSON.parse(eoc!.data) as { channelId: number; data: string };
-    expect(eocInner.channelId).toBe(1);
+    expect(eocInner.channelId).toBe(0);
     expect(JSON.parse(eocInner.data)).toMatchObject({ candidate: "" });
   });
 

@@ -6,10 +6,9 @@
  * SDP answer → ICE over the relay the hub grants → DTLS → SCTP data channels, with commands riding
  * `WebrtcDataChannel` as portal packets (see {@link buildPortalPacket}).
  *
- * `set-payload` rides the `1350` SET_PAYLOAD envelope, inner `{account_id, cmd, mValue3, payload}`, on
- * the station channel `255`: the frame the app sends for arming (`cmd 1224`, `{mode_type, user_name}`),
- * answered by a `1350` ACK and a pushed `1151` MODE_SWITCH. `set-json` rides the `1700` CONTROL_PAYLOAD
- * envelope, inner `{account_id, cmd, commandType, data}`. An attached device's command shares its parent
+ * `set-payload` rides the `1350` SET_PAYLOAD envelope, inner `{account_id, cmd, mValue3, payload}`;
+ * `set-json` rides the `1700` CONTROL_PAYLOAD envelope, inner `{account_id, cmd, commandType, data}`.
+ * A command to the station goes on the station channel `255`; an attached device's command shares the
  * station's session and keeps the device's channel. Other command kinds are refused.
  *
  * One session per station, reused across commands and closed after {@link IDLE_CLOSE_MS} without one.
@@ -17,7 +16,6 @@
  * carries no inner command. An ACK is not an observation of the resulting state.
  */
 import type { Command } from "../../core/contracts.js";
-import type { EufyDevice } from "../../core/types.js";
 import type { Logger } from "../../core/logger.js";
 import { RtcSession, type RtcSessionOptions } from "./session.js";
 import { buildPortalPacket, parsePortalPacket, PortalLinkType, SegmentCounter } from "./portal-packet.js";
@@ -49,6 +47,15 @@ export interface RtcIdentity {
   gtoken: string;
 }
 
+/** Where a command goes: the station's session, and whether it addresses the station or a device on it. */
+export interface RtcRoute {
+  stationSn: string;
+  /** The station's `member.admin_user_id`, the account the session and the payload name. */
+  adminUserId: string;
+  /** True for a device attached to the station, which keeps the command's own channel. */
+  attached: boolean;
+}
+
 export interface RtcCommandRouterDeps {
   /** The logged-in session's credentials; `undefined` while logged out. */
   identity: () => RtcIdentity | undefined;
@@ -56,8 +63,6 @@ export interface RtcCommandRouterDeps {
   shard: () => string;
   /** ISO country sent on the sign request (default `US`). */
   country?: string;
-  /** Resolve a device record by serial (model, member, stationSn). */
-  findDevice: (sn: string) => EufyDevice | undefined;
   logger?: Logger;
   onError?: (e: Error) => void;
   createSession?: (opts: RtcSessionOptions) => RtcSession;
@@ -79,39 +84,14 @@ export class RtcCommandRouter {
 
   constructor(private readonly deps: RtcCommandRouterDeps) {}
 
-  /** A T9000 station itself. */
-  static claimsDevice(dev: EufyDevice): boolean {
-    return /^T9000/i.test(dev.model ?? "") && (!dev.stationSn || dev.stationSn === dev.sn);
-  }
-
-  /** A device attached to a T9000 station: its commands ride the station's session. */
-  static claimsAttached(dev: EufyDevice, stationOf: (sn: string) => EufyDevice | undefined): boolean {
-    if (!dev.stationSn || dev.stationSn === dev.sn) return false;
-    const station = stationOf(dev.stationSn);
-    return !!station && RtcCommandRouter.claimsDevice(station);
-  }
-
-  async dispatchCommand(sn: string, cmd: Command): Promise<void> {
+  async dispatchCommand(route: RtcRoute, cmd: Command): Promise<void> {
     if (cmd.kind !== "set-payload" && cmd.kind !== "set-json") {
       throw new Error(`rtc: ${cmd.kind} is not routable over the T9000 control channel (only set-payload or set-json)`);
     }
-    const dev = this.deps.findDevice(sn);
-    const stationSn = dev?.stationSn || sn;
-    const station = this.deps.findDevice(stationSn);
-    if (!dev || !station || !RtcCommandRouter.claimsDevice(station))
-      throw new Error("RTC command requires a known T9000 station or attached device");
-    const channel = stationSn === sn ? PORTAL_STATION_CHANNEL : cmd.channel;
-    if (
-      !Number.isInteger(channel) ||
-      channel < 0 ||
-      channel > PORTAL_STATION_CHANNEL ||
-      (stationSn !== sn && channel === PORTAL_STATION_CHANNEL)
-    )
-      throw new RangeError("RTC command requires a valid device channel");
     const identity = this.deps.identity();
-    if (!identity) throw new Error(`rtc: not logged in, cannot drive ${sn}`);
-    const member = ((station.raw ?? {}) as { member?: { admin_user_id?: unknown } }).member;
-    const adminUserId = (typeof member?.admin_user_id === "string" && member.admin_user_id) || identity.userId;
+    if (!identity) throw new Error(`rtc: not logged in, cannot drive ${route.stationSn}`);
+    const { stationSn, adminUserId } = route;
+    const channel = route.attached ? cmd.channel : PORTAL_STATION_CHANNEL;
     const st = await this.stationSession(stationSn, adminUserId, identity);
     const outerCmd = cmd.kind === "set-json" ? PORTAL_CMD_CONTROL_PAYLOAD : PORTAL_CMD_SET_PAYLOAD;
     const innerCmd = cmd.kind === "set-json" ? cmd.param : cmd.cmd;
@@ -255,6 +235,7 @@ export class RtcCommandRouter {
         const p = parsePortalPacket(frame, linkType);
         if (!p || p.segment !== segment) return;
         const acknowledgement = linkType === PortalLinkType.COMMAND && p.commandId === outerCmd && !!p.isResponse;
+        const d = p.data as { payload?: unknown } | null | undefined;
         const notification =
           outerCmd === PORTAL_CMD_CONTROL_PAYLOAD &&
           linkType === PortalLinkType.NOTIFY &&
@@ -262,13 +243,8 @@ export class RtcCommandRouter {
           p.isResponse === 0 &&
           p.channel === channel &&
           p.cmd === innerCmd &&
-          typeof p.data === "object" &&
-          p.data !== null &&
-          !Array.isArray(p.data) &&
-          "payload" in p.data &&
-          typeof p.data.payload === "object" &&
-          p.data.payload !== null &&
-          !Array.isArray(p.data.payload);
+          typeof d?.payload === "object" &&
+          d.payload !== null;
         if (!acknowledgement && !notification) return;
         cleanup();
         if (acknowledgement && p.errCode !== 0) {

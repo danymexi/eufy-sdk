@@ -7,6 +7,7 @@ import {
   PtcsReassembler,
   frameIdClock,
   linkTypeForChannel,
+  PTCS_STALE_MS,
   packetize,
   parsePtcsHeader,
 } from "../ptcs-framer.js";
@@ -71,7 +72,6 @@ describe("PTCS reassembly", () => {
       expect(got).toHaveLength(1);
       expect(got[0]![0].toString("hex")).toBe(v.frameHex);
       expect(got[0]![1]).toBe(v.channel);
-      expect(r.pending).toBe(0);
     }
   });
 
@@ -92,15 +92,18 @@ describe("PTCS reassembly", () => {
   it("never delivers a frame with a packet missing, and forgets it once stale", () => {
     let now = 0;
     const got: Buffer[] = [];
-    const r = new PtcsReassembler((f) => got.push(f), { staleMs: 15_000, now: () => now });
+    const r = new PtcsReassembler(
+      (f) => got.push(f),
+      () => now,
+    );
     const pk = packetize(Buffer.alloc(2000, 1), { frameId: 5, payloadBytes: 800 });
     r.push(pk[0]!);
     r.push(pk[2]!);
     expect(got).toEqual([]);
-    expect(r.pending).toBe(1);
-    now = 20_000;
-    expect(r.expire()).toBe(1);
-    expect(r.pending).toBe(0);
+    now = PTCS_STALE_MS + 1;
+    r.expire();
+    r.push(pk[1]!);
+    expect(got).toEqual([]);
   });
 
   it("rejects a frame whose lengths don't add up", () => {
@@ -117,15 +120,15 @@ describe("PtcsFramer", () => {
   it("frames outbound, reassembles inbound, maps channels to link types, and passes bare XZYH through", async () => {
     const wire: Buffer[] = [];
     const frames: Array<[Buffer, number]> = [];
-    const f = new PtcsFramer({ nextFrameId: () => 42 });
-    await f.init(
+    const f = new PtcsFramer();
+    f.init(
       (p) => wire.push(p),
       (frame, lt) => frames.push([frame, lt]),
     );
     const out = Buffer.from("XZYH" + "x".repeat(1100));
     f.sendFrame(out);
     expect(wire).toHaveLength(2);
-    expect(parsePtcsHeader(wire[0]!)?.frameId).toBe(42);
+    expect(parsePtcsHeader(wire[0]!)?.frameId).toBe(parsePtcsHeader(wire[1]!)?.frameId);
     for (const p of packetize(Buffer.from("notify!"), { frameId: 7, channel: PtcsChannel.NOTIFY })) f.recvPacket(p);
     f.recvPacket(Buffer.from("XZYHbare-16-bytes!"));
     expect(frames.map(([b, lt]) => [b.toString(), lt])).toEqual([
@@ -137,13 +140,10 @@ describe("PtcsFramer", () => {
     expect(() => f.sendFrame(out)).toThrow(/not initialised/);
   });
 
-  it("maps the portal's channels", () => {
+  it("maps the notify channel to notify and everything else to command", () => {
     expect(linkTypeForChannel(0)).toBe(PortalLinkType.COMMAND);
     expect(linkTypeForChannel(2)).toBe(PortalLinkType.NOTIFY);
-    expect(linkTypeForChannel(3)).toBe(PortalLinkType.FILE);
-    expect(linkTypeForChannel(4)).toBe(PortalLinkType.PLAYBACK);
-    expect(linkTypeForChannel(5)).toBe(PortalLinkType.LIVE);
-    expect(linkTypeForChannel(77)).toBe(PortalLinkType.INNER);
+    expect(linkTypeForChannel(5)).toBe(PortalLinkType.COMMAND);
   });
 
   it("draws ids from a clock and never repeats one", () => {
@@ -187,14 +187,14 @@ describe("the portal's own packets", () => {
 
   it("steps the frame counter once per frame, not once per packet", () => {
     const wire: Buffer[] = [];
-    const f = new PtcsFramer({ nextFrameId: () => 1, sequence: 25 });
-    void f.init(
+    const f = new PtcsFramer();
+    f.init(
       (p) => wire.push(p),
       () => {},
     );
     f.sendFrame(Buffer.from("XZYH" + "x".repeat(1500))); // two packets, one frame
     f.sendFrame(Buffer.from("XZYH" + "y".repeat(10))); // one packet, next frame
-    expect(wire.map((p) => parsePtcsHeader(p)!.sequence)).toEqual([25, 25, 26]);
+    expect(wire.map((p) => parsePtcsHeader(p)!.sequence)).toEqual([0, 0, 1]);
     f.destroy();
   });
 });

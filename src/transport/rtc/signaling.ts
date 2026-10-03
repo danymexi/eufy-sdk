@@ -3,7 +3,7 @@
  * WebRTC session. It is the wire the security.eufy.com web client uses (`/v1/rtc/ws/join`), and the hub
  * accepts it from any client presenting the account's mega token.
  *
- * Sequence (wire reversed by genomez/eufy-security-client, MIT):
+ * Sequence:
  *
  *   1. `GET https://<smart host>/v1/smart/nvr/ws/sign` with the mega token → a `sign` blob.
  *   2. WebSocket to `wss://<smart host>/v1/rtc/ws/join?reqtype=nvr`, subprotocols `["v1", <base64url
@@ -14,8 +14,8 @@
  *      `channelId + adminUserId + ts`, keyed by the token.
  *
  * Region is two values: the HTTP sign request names the account's **country** (`Web-Country`), the
- * WebSocket payload names the **cluster**, which is the shard prefix uppercased (`ie-pr` → `IE`). A
- * country in the cluster slot authenticates the sign and then fails the socket.
+ * WebSocket payload names the **cluster**, the shard prefix uppercased (`ie-pr` → `IE`). The smart host
+ * is `security-smart` for `us` and `security-smart-<prefix>` for any other shard.
  *
  * `fetch` and the `WebSocket` constructor are injectable.
  */
@@ -24,25 +24,8 @@ import { EventEmitter } from "node:events";
 import { createHmac, randomUUID } from "node:crypto";
 import { noopLogger, type Logger } from "../../core/logger.js";
 
-/**
- * The signalling host for a mega shard: the bare `security-smart` host for `us`, else
- * `security-smart-<prefix>` (`eu-pr` → `security-smart-eu`, `ie-pr` → `security-smart-ie`).
- */
-export function smartHostForShard(shard: string): string {
-  const prefix = shard.split("-")[0]?.toLowerCase();
-  return !prefix || prefix === "us" ? "security-smart.eufylife.com" : `security-smart-${prefix}.eufylife.com`;
-}
-
-/**
- * The cluster name the WebSocket subprotocol payload carries: the shard prefix uppercased (us-pr → US,
- * eu-pr → EU, ie-pr → IE). An `ie-pr` account is answered 101 with `"IE"` and 400 with `"EU"`.
- */
-export function wsRegionForShard(shard: string): string {
-  return (shard.split("-")[0] || "us").toUpperCase();
-}
-
-export const RTC_WS_PATH = "/v1/rtc/ws/join?reqtype=nvr";
-export const RTC_SIGN_PATH = "/v1/smart/nvr/ws/sign";
+const RTC_WS_PATH = "/v1/rtc/ws/join?reqtype=nvr";
+const RTC_SIGN_PATH = "/v1/smart/nvr/ws/sign";
 /** The portal's origin; the sign endpoint and the socket upgrade both check it. */
 export const PORTAL_ORIGIN = "https://security.eufy.com";
 /** The hub drops an idle signalling socket after ~83 s; re-sending auth inside that keeps it. */
@@ -123,18 +106,6 @@ export interface RtcSignalingEvents {
   error: [err: Error];
 }
 
-/** Raised when the sign endpoint refuses the token. */
-export class RtcSignError extends Error {
-  constructor(
-    message: string,
-    readonly httpStatus: number,
-    readonly apiCode: number | undefined,
-  ) {
-    super(message);
-    this.name = "RtcSignError";
-  }
-}
-
 /** The portal's `account` field: HMAC-SHA256 of `channelId + adminUserId + ts`, keyed by the token. */
 export function sessionAccount(channelId: number, adminUserId: string, ts: number, authToken: string): string {
   return createHmac("sha256", authToken).update(`${channelId}${adminUserId}${ts}`).digest("hex");
@@ -156,7 +127,9 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
   private ws?: SignalingSocket;
   private sign?: string;
   private keepalive?: NodeJS.Timeout;
-  private readonly smartHost: string;
+  private readonly wsUrl: string;
+  private readonly signUrl: string;
+  private readonly wsRegion: string;
   private readonly fetchImpl: typeof fetch;
   private readonly createSocket: SignalingSocketFactory;
   private readonly logger: Logger;
@@ -165,20 +138,16 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
 
   constructor(private readonly opts: RtcSignalingOptions) {
     super();
-    this.smartHost = smartHostForShard(opts.shard);
+    const prefix = (opts.shard.split("-")[0] || "us").toLowerCase();
+    const smartHost = prefix === "us" ? "security-smart.eufylife.com" : `security-smart-${prefix}.eufylife.com`;
+    this.wsUrl = `wss://${smartHost}${RTC_WS_PATH}`;
+    this.signUrl = `https://${smartHost}${RTC_SIGN_PATH}`;
+    this.wsRegion = prefix.toUpperCase();
     this.fetchImpl = opts.fetch ?? fetch;
     this.createSocket = opts.createSocket ?? defaultSocket;
     this.logger = opts.logger ?? noopLogger;
     this.now = opts.now ?? Date.now;
     this.makeMsgId = opts.makeMsgId ?? (() => randomUUID().replace(/-/g, ""));
-  }
-
-  get wsUrl(): string {
-    return `wss://${this.smartHost}${RTC_WS_PATH}`;
-  }
-
-  get signUrl(): string {
-    return `https://${this.smartHost}${RTC_SIGN_PATH}`;
   }
 
   get isOpen(): boolean {
@@ -199,28 +168,12 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     });
     const body = ((await res.json().catch(() => ({}))) ?? {}) as { code?: number; data?: string; msg?: string };
     if (!res.ok || body.code !== 0 || !body.data) {
-      throw new RtcSignError(
-        `RTC sign for ${this.opts.stationSn} refused: HTTP ${res.status} ${body.msg ?? ""}`.trim(),
-        res.status,
-        body.code,
+      throw new Error(
+        `RTC sign for ${this.opts.stationSn} refused: HTTP ${res.status} code ${body.code ?? "?"} ${body.msg ?? ""}`.trim(),
       );
     }
     this.sign = body.data;
     return body.data;
-  }
-
-  /** The JSON that authenticates the socket (subprotocol slot 2, base64url-encoded on the wire). */
-  subprotocolPayload(sign: string): Record<string, unknown> {
-    return {
-      region: wsRegionForShard(this.opts.shard),
-      type: "NVR",
-      sn: this.opts.stationSn,
-      token: this.opts.authToken,
-      gtoken: this.opts.gtoken,
-      sign,
-      appName: "eufy_mega",
-      modelType: "WEB",
-    };
   }
 
   /**
@@ -230,7 +183,17 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
   async connect(): Promise<void> {
     if (this.ws) return;
     const sign = this.sign ?? (await this.fetchSign());
-    const protocols = ["v1", Buffer.from(JSON.stringify(this.subprotocolPayload(sign))).toString("base64url")];
+    const auth = {
+      region: this.wsRegion,
+      type: "NVR",
+      sn: this.opts.stationSn,
+      token: this.opts.authToken,
+      gtoken: this.opts.gtoken,
+      sign,
+      appName: "eufy_mega",
+      modelType: "WEB",
+    };
+    const protocols = ["v1", Buffer.from(JSON.stringify(auth)).toString("base64url")];
     this.logger.debug(`[rtc] ${this.opts.stationSn} signalling connect ${this.wsUrl}`);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -284,8 +247,12 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     });
   }
 
-  /** `action 3`, a session message; `scall` opens the negotiation. `subSn` is empty for the hub's session. */
-  sendSession(dataType: string, payload: Record<string, unknown> = {}, channelId = 0): void {
+  /**
+   * `action 3`, a session message on channel 0, the hub's own session; `scall` opens the negotiation.
+   * `subSn` is empty for the hub's session.
+   */
+  sendSession(dataType: string, payload: Record<string, unknown> = {}): void {
+    const channelId = 0;
     const ts = Math.floor(this.now() / 1000);
     const inner = {
       code: 200,
@@ -307,29 +274,26 @@ export class RtcSignalingClient extends EventEmitter<RtcSignalingEvents> {
     this.sendEnvelope(`${this.opts.authToken}_${this.makeMsgId()}`, inner);
   }
 
-  sendCall(channelId = 0): void {
-    this.sendSession("scall", {}, channelId);
+  sendCall(): void {
+    this.sendSession("scall");
   }
 
-  sendAck(channelId = 0): void {
-    this.sendSession("ack", {}, channelId);
+  sendAck(): void {
+    this.sendSession("ack");
   }
 
   /** The SDP answer, as scall JSON text, in an `info`. */
-  sendInfoSdp(scallJson: string, channelId = 0): void {
-    this.sendSession("info", { sdp: scallJson }, channelId);
+  sendInfoSdp(scallJson: string): void {
+    this.sendSession("info", { sdp: scallJson });
   }
 
-  /**
-   * Trickle a candidate on the session's own channel, the same channel as its SDP answer. An empty
-   * candidate is end-of-candidates.
-   */
-  sendInfoCandidate(candidate: string, channelId = 0): void {
-    this.sendSession("info", { candidate }, channelId);
+  /** Trickle a candidate on the session's channel, like its SDP answer. An empty candidate ends them. */
+  sendInfoCandidate(candidate: string): void {
+    this.sendSession("info", { candidate });
   }
 
-  sendHangup(channelId = 0): void {
-    this.sendSession("hangup", {}, channelId);
+  sendHangup(): void {
+    this.sendSession("hangup");
   }
 
   close(): void {
