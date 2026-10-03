@@ -41,6 +41,8 @@ import {
 // By direct path, not the barrel: `narrow` is internal to `capabilities/` and must not join the
 // barrel's published surface. Its own JSDoc states why it is shared.
 import { narrow } from "./capabilities/members.js";
+import { scalarPropertySpec, scalarPropertyValue } from "./capabilities/property-values.js";
+import type { AvailabilityContext } from "./capabilities/types.js";
 import { paramDef, namespaceForCodec, type ParamNamespace } from "./param-namespace.js";
 
 /**
@@ -194,6 +196,9 @@ export class Device {
    * answers a caller has to be able to tell apart.
    */
   private bound = false;
+  /** Bound context and optional synchronous payload decoder for scalar cached reads. */
+  private propertyReadContext: AvailabilityContext = {};
+  private propertyRawDp?: RawDpCodec;
 
   /**
    * Read-through freshness policy (injected by the facade via {@link setFreshnessPolicy}; the model
@@ -228,6 +233,11 @@ export class Device {
    */
   private resolveInto(resolved: ResolvedDevice): void {
     this.codec = resolved.codec;
+    this.propertyReadContext = {
+      ...this.propertyReadContext,
+      codec: resolved.codec,
+      capabilities: new Set(resolved.capabilities),
+    };
     this.capabilities = resolved.capabilities;
     this.properties = resolved.properties;
     this.modelName = resolved.name;
@@ -298,6 +308,8 @@ export class Device {
     ff09Settings?: Ff09SettingsReader,
     rawDp?: RawDpCodec,
   ): void {
+    this.propertyReadContext = ctx;
+    this.propertyRawDp = rawDp;
     this.actionMap = buildActions(this.capabilities, {
       ctx,
       sink,
@@ -344,6 +356,13 @@ export class Device {
    */
   private adoptIdentity(rec: CloudRecord): void {
     this.model = rec.model ?? this.model;
+    this.propertyReadContext = {
+      ...this.propertyReadContext,
+      model: this.model,
+      deviceType: rec.deviceType ?? this.propertyReadContext.deviceType,
+      category: rec.category ?? this.propertyReadContext.category,
+      paramIds: new Set([...(this.propertyReadContext.paramIds ?? []), ...Object.keys(rec.params ?? {}).map(Number)]),
+    };
     this.deviceName = rec.name ?? this.deviceName;
     this.name = this.deviceName ?? this.modelName;
     this.stationSn = rec.parentSn ?? this.stationSn;
@@ -370,6 +389,27 @@ export class Device {
   setFreshnessPolicy(policy: { staleAfterMs: number; refresh: () => Promise<void> }): void {
     this.staleAfterMs = policy.staleAfterMs;
     this.refresher = policy.refresh;
+  }
+
+  /** Scalar schemas derived from the typed member reads; unexposed parameters remain explicitly marked. */
+  getPropertySpecs(): readonly PropertySpec[] {
+    return this.properties.map((spec) => scalarPropertySpec(this.capabilities, spec, this.propertyReadContext));
+  }
+
+  /** A typed cached scalar. Does not schedule a refresh or expose unknown parameters. */
+  getPropertyValue(name: string): boolean | number | string | undefined {
+    const spec = this.specByName.get(name);
+    if (!spec) return undefined;
+    return scalarPropertyValue(this.capabilities, spec, {
+      ctx: this.propertyReadContext,
+      read: (key) => this.state.get(key),
+      rawDp: this.propertyRawDp,
+    });
+  }
+
+  /** Typed cached scalars for declared properties only, without refresh side effects. */
+  getPropertyValues(): Readonly<Record<string, boolean | number | string | undefined>> {
+    return Object.fromEntries(this.properties.map((spec) => [spec.name, this.getPropertyValue(spec.name)]));
   }
 
   /**

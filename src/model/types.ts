@@ -206,6 +206,8 @@ export interface PropertySpec {
   writable: boolean;
   /** Allowed values for `type: "enum"` (raw → label). */
   enumValues?: Record<number, string>;
+  /** Allowed decoded read values, when the member declares a finite domain. */
+  values?: readonly (string | number)[];
   /**
    * Trust level of this `paramType` mapping. Default (absent) = `guessed`. Anything still `guessed`
    * is a candidate for confirmation against a first-party source, never relied on.
@@ -240,6 +242,8 @@ export interface PropertySpec {
    * properties were misdeclared, which is how a real warning goes unread.
    */
   raw?: true;
+  /** The stored parameter has no confirmed typed read on its capability. */
+  unexposed?: true;
   /**
    * Extra wire param ids that ALSO carry this property on some device families, with their own
    * polarity. The device's own `paramType` wins; otherwise the first alias the device reports wins.
