@@ -16,10 +16,15 @@ Contributions are provided under that same license (inbound = outbound).
 
 ```bash
 nvm use                 # Node 24.5.0 (see .nvmrc) — required, not just recommended
+npm install --global npm@11.20.0
 npm install
 npm run build           # tsc → dist/ (ESM)
 npm test                # vitest (offline, synthetic fixtures)
 ```
+
+CI uses npm 11.20.0. Node 24.5.0 bundles npm 11.5.1, which can prune optional native
+dependencies reached through a peer dependency and prevent the test runner from starting.
+The selected version includes the npm 11.6.1 peer-flag fix and installs from the existing lockfile.
 
 `ffmpeg` is optional — only the JPEG-snapshot and one-shot mp4 record paths
 use it.
