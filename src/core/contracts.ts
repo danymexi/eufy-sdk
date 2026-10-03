@@ -998,3 +998,26 @@ export interface Ff09SettingsReader {
   /** Read the device's current auto-lock settings via a live `GET_SETTINGS` round-trip. */
   getAutoLockState(): Promise<AutoLockSnapshot>;
 }
+
+/** A structured payload notification observed during a bounded payload read. */
+export interface PortalPayloadObservation {
+  /** The complete decoded notification envelope, with feature semantics left uninterpreted. */
+  payload: unknown;
+  /** Local notification arrival time in Unix milliseconds, independent of acknowledgement completion. */
+  receivedAtMs: number;
+  /** The notification is associated by the receiving session and read window, not exact request identity. */
+  correlation: "time-associated";
+  exactlyCorrelated: false;
+}
+
+/**
+ * Explicitly read a structured payload using the station's shared portal session. Acquisition and
+ * one send share a finite deadline, with no retry; busy or changed ownership rejects the read.
+ * Bound to one station, with feature-command identifiers and payload semantics supplied opaquely.
+ */
+export interface PortalPayloadReader {
+  readPayload(
+    intent: Extract<Command, { kind: "set-payload" }>,
+    signal?: AbortSignal,
+  ): Promise<PortalPayloadObservation>;
+}

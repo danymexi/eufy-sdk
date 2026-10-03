@@ -19,6 +19,7 @@ import type { Command } from "../../core/contracts.js";
 import type { Logger } from "../../core/logger.js";
 import { RtcSession, type RtcSessionOptions } from "./session.js";
 import { buildPortalPacket, parsePortalPacket, PortalLinkType, SegmentCounter } from "./portal-packet.js";
+import { awaitPayloadOwner, readPortalPayload } from "./portal-payload-reader.js";
 
 /** The SET_PAYLOAD envelope. */
 const PORTAL_CMD_SET_PAYLOAD = 1350;
@@ -73,6 +74,8 @@ interface StationSession {
   ready: Promise<void>;
   /** Serialises sends so ACKs can't be attributed to the wrong command. */
   queue: Promise<unknown>;
+  pending: number;
+  owner: RtcIdentity & { adminUserId: string; shard: string };
   idle?: ReturnType<typeof setTimeout>;
 }
 
@@ -98,9 +101,97 @@ export class RtcCommandRouter {
         : { account_id: adminUserId, cmd: cmd.cmd, mValue3: cmd.mValue3 ?? 0, payload: cmd.payload };
     const segment = st.seg.next();
     const packet = buildPortalPacket({ commandId: outerCmd, channel, segment, payload });
-    const run = st.queue.then(() => this.sendAwaitAck(stationSn, st, packet, outerCmd, innerCmd, channel, segment));
+    st.pending++;
+    const run = st.queue
+      .then(() => this.sendAwaitAck(stationSn, st, packet, outerCmd, innerCmd, channel, segment))
+      .finally(() => {
+        st.pending--;
+        this.touch(stationSn, st);
+      });
     st.queue = run.catch(() => undefined);
     return run;
+  }
+
+  /** Explicit payload read; shares the normal station owner and bounds acquisition plus exchange to 15 seconds. */
+  async readPayload(
+    route: Pick<RtcRoute, "stationSn" | "adminUserId">,
+    intent: Extract<Command, { kind: "set-payload" }>,
+    isRecordCurrent: () => boolean,
+    signal?: AbortSignal,
+  ) {
+    const { stationSn: sn, adminUserId } = route;
+    const identity = this.deps.identity();
+    if (!identity || !sn || !adminUserId || !isRecordCurrent())
+      throw new Error("rtc: payload read requires a known logged-in station");
+    if (signal?.aborted) throw new Error("rtc: payload read aborted");
+    if (!Number.isInteger(intent.channel) || intent.channel < 0 || intent.channel > 255)
+      throw new RangeError("rtc: payload read requires a valid channel");
+    const caller = { ...identity, adminUserId, shard: this.deps.shard() };
+    const abort = new AbortController();
+    const onAbort = () => abort.abort();
+    const timer = setTimeout(onAbort, 15_000);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const existing = this.sessions.get(sn);
+      if (existing?.pending) throw new Error("rtc: payload read requires an idle station session");
+      const st = await awaitPayloadOwner(this.stationSession(sn, adminUserId, identity), abort.signal);
+      const isCurrent = () => {
+        const auth = this.deps.identity();
+        return (
+          this.sessions.get(sn) === st &&
+          st.session.isConnected &&
+          isRecordCurrent() &&
+          !!auth &&
+          auth.authToken === st.owner.authToken &&
+          auth.userId === st.owner.userId &&
+          auth.gtoken === st.owner.gtoken &&
+          caller.authToken === st.owner.authToken &&
+          caller.userId === st.owner.userId &&
+          caller.gtoken === st.owner.gtoken &&
+          caller.adminUserId === st.owner.adminUserId &&
+          caller.shard === st.owner.shard &&
+          this.deps.shard() === st.owner.shard
+        );
+      };
+      if (!isCurrent()) throw new Error("rtc: payload read session owner changed");
+      if (st.pending !== 0) throw new Error("rtc: payload read requires an idle station session");
+      const segment = st.seg.next();
+      const packet = buildPortalPacket({
+        commandId: PORTAL_CMD_SET_PAYLOAD,
+        channel: intent.channel,
+        segment,
+        payload: {
+          account_id: adminUserId,
+          cmd: intent.cmd,
+          mChannel: intent.channel,
+          mValue3: intent.mValue3 ?? 0,
+          payload: intent.payload,
+        },
+      });
+      st.pending++;
+      if (st.idle) clearTimeout(st.idle);
+      const run = st.queue
+        .then(() =>
+          readPortalPayload({
+            session: st.session,
+            packet,
+            stationSn: sn,
+            intent,
+            segment,
+            isCurrent,
+            signal: abort.signal,
+          }),
+        )
+        .finally(() => {
+          st.pending--;
+          this.touch(sn, st);
+        });
+      st.queue = run.catch(() => undefined);
+      return await run;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   /** Tear down every station session (logout / shutdown). */
@@ -190,7 +281,14 @@ export class RtcCommandRouter {
       peer: { logger: this.deps.logger },
     });
     const ready = this.bringUp(sn, session);
-    const st: StationSession = { session, seg: new SegmentCounter(), ready, queue: Promise.resolve() };
+    const st: StationSession = {
+      session,
+      seg: new SegmentCounter(),
+      ready,
+      queue: Promise.resolve(),
+      pending: 0,
+      owner: { ...identity, adminUserId, shard: this.deps.shard() },
+    };
     session.on("error", (e) => this.deps.onError?.(e));
     session.on("close", () => {
       if (this.sessions.get(sn) === st) this.sessions.delete(sn);
@@ -249,6 +347,7 @@ export class RtcCommandRouter {
 
   private touch(sn: string, st: StationSession): void {
     if (st.idle) clearTimeout(st.idle);
+    if (st.pending !== 0 || this.sessions.get(sn) !== st || !st.session.isConnected) return;
     st.idle = setTimeout(() => this.drop(sn, st), IDLE_CLOSE_MS);
     st.idle.unref?.();
   }

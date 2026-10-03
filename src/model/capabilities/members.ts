@@ -22,6 +22,7 @@ import {
   type Ff09SettingsReader,
   type MediaProvider,
   type RawDpCodec,
+  type PortalPayloadReader,
 } from "../../core/contracts.js";
 import { describedAction, readBool, readNum, readStr } from "./access.js";
 import type { ActionArgSpec, ActionSpec, AvailabilityContext, CapabilityStateReader, CommandContext } from "./types.js";
@@ -311,6 +312,8 @@ export interface MemberDeps {
    * so any device driven by that frame can use it — see {@link Ff09SettingsReader}.
    */
   ff09Settings?: Ff09SettingsReader;
+  /** Read structured payloads on an existing station session, without acquiring one. */
+  portalPayload?: PortalPayloadReader;
 }
 
 /**

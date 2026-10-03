@@ -25,7 +25,13 @@ import type {
   PropertyValue,
   ResolvedDevice,
 } from "./types.js";
-import type { CommandSink, MediaProvider, Ff09SettingsReader, RawDpCodec } from "../core/contracts.js";
+import type {
+  CommandSink,
+  MediaProvider,
+  Ff09SettingsReader,
+  RawDpCodec,
+  PortalPayloadReader,
+} from "../core/contracts.js";
 import { noopLogger, type Logger } from "../core/logger.js";
 import { structuralEqual } from "../core/util.js";
 import { resolveDevice, resolveProperties } from "./registry.js";
@@ -297,6 +303,7 @@ export class Device {
     media?: MediaProvider,
     ff09Settings?: Ff09SettingsReader,
     rawDp?: RawDpCodec,
+    portalPayload?: PortalPayloadReader,
   ): void {
     this.actionMap = buildActions(this.capabilities, {
       ctx,
@@ -305,6 +312,7 @@ export class Device {
       media,
       ff09Settings,
       rawDp,
+      portalPayload,
     });
     this.bound = true;
   }
