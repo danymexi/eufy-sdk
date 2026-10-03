@@ -41,6 +41,7 @@ const EXPECTED_ACCESSORS = [
   "siren",
   "smartLight",
   "smoke",
+  "storage",
   "vacuumClean",
   "vacuumDock",
 ] as const;

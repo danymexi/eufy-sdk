@@ -58,6 +58,7 @@ import {
   type CommandSink,
   type Ff09SettingsReader,
   type MediaProvider,
+  type PortalPayloadReader,
   type TuyaDpInbound,
 } from "../core/contracts.js";
 import { noopLogger } from "../core/logger.js";
@@ -635,6 +636,7 @@ export class EufyMega extends EventEmitter {
         this.mediaProviderFor(sn),
         this.ff09SettingsReaderFor(sn, ctx),
         rawDpCodec,
+        this.portalPayloadReaderFor(sn, ctx),
       );
       this.boundParamIds.set(sn, new Set([...(this.boundParamIds.get(sn) ?? []), ...ctx.paramIds]));
       this.emit("deviceState", this.deviceState(sn));
@@ -1277,6 +1279,7 @@ export class EufyMega extends EventEmitter {
       this.mediaProviderFor(sn),
       this.ff09SettingsReaderFor(sn, ctx),
       rawDpCodec,
+      this.portalPayloadReaderFor(sn, ctx),
     );
     this.boundParamIds.set(sn, ctx.paramIds);
     if (this.opts.autoRealtime !== false) {
@@ -1311,6 +1314,26 @@ export class EufyMega extends EventEmitter {
         ctx.hasP2p
           ? this.p2p.getAutoLockState(sn, { adminUserId, deviceSn })
           : this.mqtt.getAutoLockState(sn, { adminUserId, deviceSn }),
+    };
+  }
+
+  /** Inject the optional portal frame reader without acquiring a session or fetching a record. */
+  private portalPayloadReaderFor(sn: string, ctx: CommandContext): PortalPayloadReader | undefined {
+    const dev = this.registry.list().find((entry) => entry.sn === sn);
+    if (!dev || !RtcCommandRouter.claimsDevice(dev)) return undefined;
+    return {
+      readPayload: (intent, signal) => {
+        const current = this.registry.list().find((entry) => entry.sn === sn);
+        const raw = (current?.raw ?? {}) as Record<string, unknown>;
+        if (
+          !current ||
+          !RtcCommandRouter.claimsDevice(current) ||
+          current.model !== ctx.model ||
+          recordString(raw, "main_sw_version") !== ctx.firmwareVersion
+        )
+          return Promise.reject(new Error("rtc: payload reader device record changed"));
+        return this.rtc.readPayload(sn, intent, signal);
+      },
     };
   }
 
@@ -1623,6 +1646,7 @@ export class EufyMega extends EventEmitter {
         this.mediaProviderFor(sn),
         this.ff09SettingsReaderFor(sn, ctx),
         rawDpCodec,
+        this.portalPayloadReaderFor(sn, ctx),
       );
       this.boundParamIds.set(sn, ctx.paramIds);
       this.emit("deviceCapabilities", { deviceSn: sn, gained, capabilities: [...dev.capabilities] });
