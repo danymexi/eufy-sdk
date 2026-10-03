@@ -2,15 +2,12 @@
  * The command framing a HomeBase S1 Pro (T9000) speaks over its WebRTC data channel — the wire the
  * security.eufy.com web client builds, reproduced byte-exact.
  *
- * A packet is a 16-byte header behind the ASCII magic `XZYH`, then a body. The body is the JSON the
- * classic P2P path would have sealed into a 1350 SET_PAYLOAD envelope, sent in the clear (the DTLS
- * channel is the encryption), except for a short list of two-integer commands the portal encodes as a
- * fixed 136-byte struct instead. Replies come back with `isResponse = 1`, the same `segment` the request
- * carried, and a body whose first four bytes are a little-endian result code.
+ * A packet is a 16-byte header behind the ASCII magic `XZYH`, then a JSON body, sent in the clear (the
+ * DTLS channel is the encryption). Replies come back with `isResponse = 1`, the same `segment` the
+ * request carried, and a body whose first four bytes are a little-endian result code.
  *
- * Evidence: the portal bundle's header builder/parser (`Gr()` / `Qr()`) and `worker_sctp_send`, and
- * genomez/eufy-security-client's port of them (MIT), which round-trips guard mode on US and FR T9000s.
- * No field here is inferred from a name — every offset is what those two agree on.
+ * Every offset is the portal bundle's header builder and parser (`Gr()` / `Qr()`) and its
+ * `worker_sctp_send`.
  */
 
 const MAGIC = Buffer.from("XZYH", "ascii");
@@ -20,12 +17,8 @@ export const PORTAL_HEADER_LENGTH = 16;
 export const PortalLinkType = {
   /** Command channel: requests out, acknowledgements back. */
   COMMAND: 1,
-  FILE: 2,
-  /** Station-originated frames: pushes, notify payloads, camera info. */
+  /** Station-originated frames: pushes, notify payloads, control results. */
   NOTIFY: 3,
-  PLAYBACK: 4,
-  LIVE: 5,
-  INNER: 99,
 } as const;
 
 export interface PortalHeader {
@@ -111,31 +104,9 @@ export function isPortalPacket(buf: Buffer): boolean {
   return buf.length >= PORTAL_HEADER_LENGTH && buf.subarray(0, 4).compare(MAGIC) === 0;
 }
 
-/**
- * Commands whose body the portal encodes as `[u32 value][u32 value1][account, 128 bytes]` rather than
- * JSON — the same 136-byte shape the classic P2P "direct binary" body has. The list is the portal's own.
- */
-export const TWO_INT_BODY_COMMANDS: ReadonlySet<number> = new Set([
-  1103, 1252, 1214, 1207, 1230, 1056, 1200, 1240, 1241, 1400, 1401, 9257, 1403, 1015, 1035,
-]);
-
-function encodeTwoIntBody(payload: Record<string, unknown>): Buffer {
-  const body = Buffer.alloc(136);
-  body.writeUInt32LE(Number(payload.value ?? 0) >>> 0, 0);
-  body.writeUInt32LE(Number(payload.value1 ?? 0) >>> 0, 4);
-  const account = String(payload.account_id ?? payload.account ?? "");
-  body.write(account, 8, Math.min(128, Buffer.byteLength(account, "utf8")), "utf8");
-  return body;
-}
-
-function encodeBody(commandId: number, payload: Record<string, unknown>): Buffer {
-  if (TWO_INT_BODY_COMMANDS.has(commandId)) return encodeTwoIntBody(payload);
-  return Buffer.from(JSON.stringify(payload), "utf8");
-}
-
 /** A complete request packet: header + body. */
 export function buildPortalPacket(req: PortalRequest): Buffer {
-  const body = encodeBody(req.commandId, req.payload);
+  const body = Buffer.from(JSON.stringify(req.payload), "utf8");
   const header = buildPortalHeader(
     req.commandId,
     body.length,

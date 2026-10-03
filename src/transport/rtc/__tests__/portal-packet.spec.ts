@@ -3,7 +3,6 @@ import {
   PORTAL_HEADER_LENGTH,
   PortalLinkType,
   SegmentCounter,
-  TWO_INT_BODY_COMMANDS,
   buildPortalHeader,
   buildPortalPacket,
   isPortalPacket,
@@ -47,22 +46,6 @@ describe("portal packet bodies", () => {
     expect(pkt.length).toBe(PORTAL_HEADER_LENGTH + body.length);
     expect(parsePortalHeader(pkt)?.paramLength).toBe(body.length);
     expect(pkt.subarray(PORTAL_HEADER_LENGTH).toString("utf8")).toBe(body);
-  });
-
-  it("encodes the portal's two-int commands as the 136-byte struct, account at offset 8", () => {
-    expect(TWO_INT_BODY_COMMANDS.has(1400)).toBe(true);
-    const pkt = buildPortalPacket({
-      commandId: 1400,
-      channel: 2,
-      segment: 9,
-      payload: { value: 1, value1: 0, account_id: "7765c5ef" },
-    });
-    const body = pkt.subarray(PORTAL_HEADER_LENGTH);
-    expect(body.length).toBe(136);
-    expect(body.readUInt32LE(0)).toBe(1);
-    expect(body.readUInt32LE(4)).toBe(0);
-    expect(body.subarray(8, 16).toString("ascii")).toBe("7765c5ef");
-    expect(body[16]).toBe(0);
   });
 
   it("parses a command-channel reply: int32 result code, then optional JSON", () => {

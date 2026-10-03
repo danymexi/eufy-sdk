@@ -1,15 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  COMMAND_CHANNEL,
-  DATA_CHANNEL_LABELS,
-  RtcPeer,
-  type NativeDataChannel,
-  type NativePeerConfig,
-  type NativePeerConnection,
-} from "../peer.js";
-import { ANKER_MAX_MESSAGE_SIZE, scallJsonToSdp } from "../scall-sdp.js";
+import type { DataChannel, PeerConnection, RtcConfig } from "node-datachannel";
+import { COMMAND_CHANNEL, DATA_CHANNEL_LABELS, RtcPeer } from "../peer.js";
+import { ANKER_MAX_MESSAGE_SIZE, scallJsonToSdp, sdpToScallJson } from "../scall-sdp.js";
 
-class FakeDc implements NativeDataChannel {
+/** The slice of `DataChannel` the peer drives. */
+class FakeDc {
   open = false;
   sent: Buffer[] = [];
   private cbs: Record<string, ((...a: never[]) => void) | undefined> = {};
@@ -56,7 +51,8 @@ class FakeDc implements NativeDataChannel {
   }
 }
 
-class FakePc implements NativePeerConnection {
+/** The slice of `PeerConnection` the peer drives. */
+class FakePc {
   readonly channels: FakeDc[] = [];
   remote?: { sdp: string; type: string };
   candidates: Array<[string, string]> = [];
@@ -75,10 +71,10 @@ class FakePc implements NativePeerConnection {
   addRemoteCandidate(candidate: string, mid: string): void {
     this.candidates.push([candidate, mid]);
   }
-  createDataChannel(label: string, config?: { id?: number }): NativeDataChannel {
+  createDataChannel(label: string, config?: { id?: number }): DataChannel {
     const dc = new FakeDc(label, config);
     this.channels.push(dc);
-    return dc;
+    return dc as unknown as DataChannel;
   }
   onLocalDescription(cb: (sdp: string, type: string) => void): void {
     this.cbs.local = cb as never;
@@ -92,7 +88,7 @@ class FakePc implements NativePeerConnection {
   onGatheringStateChange(cb: (state: string) => void): void {
     this.cbs.gather = cb as never;
   }
-  onDataChannel(cb: (dc: NativeDataChannel) => void): void {
+  onDataChannel(cb: (dc: DataChannel) => void): void {
     this.cbs.dc = cb as never;
   }
   fireLocalAnswer(sdp: string): void {
@@ -122,12 +118,12 @@ const ANSWER =
 
 function setup() {
   let pc!: FakePc;
-  let config!: NativePeerConfig;
+  let config!: RtcConfig;
   const peer = new RtcPeer({
     createPeer: (_name, cfg) => {
       config = cfg;
       pc = new FakePc();
-      return pc;
+      return pc as unknown as PeerConnection;
     },
   });
   return { peer, pc: () => pc, config: () => config };
@@ -139,12 +135,9 @@ describe("RtcPeer", () => {
     await peer.init({ ...TURN, alt_turn_addr: "t2", alt_turn_port: 3479 });
     expect(config().iceTransportPolicy).toBe("relay");
     expect(config().maxMessageSize).toBe(ANKER_MAX_MESSAGE_SIZE);
-    expect(config().iceServers.map((s) => `${s.relayType}@${s.hostname}:${s.port}`)).toEqual([
-      "TurnUdp@t:3478",
-      "TurnTcp@t:3478",
-      "TurnUdp@t2:3479",
-      "TurnTcp@t2:3479",
-    ]);
+    expect(
+      config().iceServers.map((s) => (typeof s === "string" ? s : `${s.relayType}@${s.hostname}:${s.port}`)),
+    ).toEqual(["TurnUdp@t:3478", "TurnTcp@t:3478", "TurnUdp@t2:3479", "TurnTcp@t2:3479"]);
   });
 
   it("answers the hub's offer: pins it passive, declares the portal's channels on even ids, pins the size", async () => {
@@ -159,7 +152,7 @@ describe("RtcPeer", () => {
     pc().fireLocalAnswer(ANSWER);
     const answer = await answering;
     expect(answer).toContain(`a=max-message-size:${ANKER_MAX_MESSAGE_SIZE}`);
-    expect(JSON.parse(peer.answerAsScallJson(answer))).toEqual({
+    expect(sdpToScallJson(answer)).toEqual({
       setup: "passive",
       ice: { ufrag: "x", pwd: "y", fingerprint_type: "sha-256", fingerprint: "aabb" },
     });
@@ -216,19 +209,17 @@ describe("RtcPeer", () => {
     pc().fireLocalAnswer(ANSWER);
     await answering;
     const cmd = pc().channels.find((c) => c.label === COMMAND_CHANNEL)!;
-    expect(peer.isCommandChannelReady).toBe(false);
     expect(peer.sendCommand(Buffer.from("XZYH-not-open-yet!"))).toBe(false);
     const opened = vi.fn();
     peer.on("commandChannelOpen", opened);
     cmd.fireOpen();
-    await vi.waitFor(() => expect(opened).toHaveBeenCalledTimes(1));
-    expect(peer.isCommandChannelReady).toBe(true);
+    expect(opened).toHaveBeenCalledTimes(1);
     const packet = Buffer.from("XZYHcommand");
     expect(peer.sendCommand(packet)).toBe(true);
     expect(cmd.sent).toHaveLength(1);
     expect(cmd.sent[0]!.subarray(0, 4).toString()).toBe("PTCS");
-    const frames: Array<[string, string, number]> = [];
-    peer.on("data", (label, frame, lt) => frames.push([label, frame.toString(), lt]));
+    const frames: Array<[string, number]> = [];
+    peer.on("data", (frame, lt) => frames.push([frame.toString(), lt]));
     cmd.fireMessage(Buffer.from("XZYHreply-16-bytes"));
     const notify = pc().channels.find((c) => c.label === "notify")!;
     notify.fireMessage(Buffer.from("XZYHpush--16-bytes"));
@@ -238,9 +229,9 @@ describe("RtcPeer", () => {
     // Every channel feeds the framer: a bare portal packet passes through as a command frame, and a
     // three-byte message is neither a portal packet nor a PTCS one.
     expect(frames).toEqual([
-      [COMMAND_CHANNEL, "XZYHreply-16-bytes", 1],
-      [COMMAND_CHANNEL, "XZYHpush--16-bytes", 1],
-      [COMMAND_CHANNEL, "XZYHvideo-16-byte!", 1],
+      ["XZYHreply-16-bytes", 1],
+      ["XZYHpush--16-bytes", 1],
+      ["XZYHvideo-16-byte!", 1],
     ]);
     const states: string[] = [];
     peer.on("connectionState", (s) => states.push(s));
@@ -248,7 +239,7 @@ describe("RtcPeer", () => {
     expect(states).toEqual(["connected"]);
     peer.close();
     expect(pc().closed).toBe(true);
-    expect(peer.isCommandChannelReady).toBe(false);
+    expect(peer.sendCommand(packet)).toBe(false);
   });
 
   it("rejects a pending local answer when the peer is closed instead of dropping it", async () => {
@@ -267,7 +258,6 @@ describe("RtcPeer", () => {
     await answering;
     const cmd = pc().channels.find((c) => c.label === COMMAND_CHANNEL)!;
     cmd.fireOpen();
-    await vi.waitFor(() => expect(peer.isCommandChannelReady).toBe(true));
     const closed = vi.fn();
     peer.on("commandChannelClosed", closed);
     // a non-command channel closing says nothing about the session
@@ -277,7 +267,7 @@ describe("RtcPeer", () => {
     expect(closed).not.toHaveBeenCalled();
     cmd.fireClosed();
     expect(closed).toHaveBeenCalledTimes(1);
-    expect(peer.isCommandChannelReady).toBe(false);
+    expect(peer.sendCommand(Buffer.from("XZYHafter-close-"))).toBe(false);
     cmd.fireClosed();
     expect(closed).toHaveBeenCalledTimes(1); // once, not per event
   });
@@ -290,7 +280,6 @@ describe("RtcPeer", () => {
     await answering;
     const cmd = pc().channels.find((c) => c.label === COMMAND_CHANNEL)!;
     cmd.fireOpen();
-    await vi.waitFor(() => expect(peer.isCommandChannelReady).toBe(true));
     expect(peer.sendCommand(Buffer.from("XZYHok----------"))).toBe(true);
     cmd.sendResult = false; // the native channel refuses the wire packet
     expect(peer.sendCommand(Buffer.from("XZYHrefused-----"))).toBe(false);
