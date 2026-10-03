@@ -1,13 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Command } from "../../core/contracts.js";
 import type { EufyDevice } from "../../core/types.js";
+import { DeviceType } from "../../model/device-types.js";
+import type { RtcRoute } from "../../transport/rtc/command-router.js";
 import { EufyMega } from "../eufy-mega.js";
 
 const HUB = "T8000P0000000000";
 const CAMERA = "T8000P0000000001";
 const command: Command = { kind: "set-json", param: 1400, data: { time: 0, type: 2, value: 0 }, channel: 3 };
 
-function fixture(stationModel = "T9000") {
+/** A hub whose cloud record carries `device_type` 27 (STATION_9000), or another station family's. */
+function fixture(stationType: number = DeviceType.STATION_9000) {
   const client = new EufyMega({
     email: "test@example.com",
     password: "synthetic",
@@ -17,12 +20,12 @@ function fixture(stationModel = "T9000") {
   });
   const internals = client as unknown as {
     registry: { list(): EufyDevice[]; devices: EufyDevice[] };
-    rtc: { dispatchCommand(sn: string, cmd: Command): Promise<void> };
+    rtc: { dispatchCommand(route: RtcRoute, cmd: Command): Promise<void> };
     p2p: { dispatchCommand(sn: string, cmd: Command): Promise<void> };
     routeCommand(sn: string, cmd: Command): Promise<void>;
   };
   const devices = [
-    { sn: HUB, model: stationModel, raw: {} },
+    { sn: HUB, model: "T9000", raw: { device_type: stationType, member: { admin_user_id: "synthetic-admin" } } },
     { sn: CAMERA, model: "T8425", stationSn: HUB, raw: { parent_sn: HUB, device_channel: 3 } },
   ] as EufyDevice[];
   internals.registry.devices = devices;
@@ -34,15 +37,30 @@ function fixture(stationModel = "T9000") {
 afterEach(() => vi.restoreAllMocks());
 
 describe("station-owned RTC command routing", () => {
-  it.each([HUB, CAMERA])("routes supported station topology through RTC for %s", async (sn) => {
+  it.each([
+    [HUB, false],
+    [CAMERA, true],
+  ])("routes %s through RTC with the station's serial and admin id", async (sn, attached) => {
     const { internals, rtc, p2p } = fixture();
     await internals.routeCommand(sn, command);
-    expect(rtc).toHaveBeenCalledExactlyOnceWith(sn, command);
+    expect(rtc).toHaveBeenCalledExactlyOnceWith({ stationSn: HUB, adminUserId: "synthetic-admin", attached }, command);
     expect(p2p).not.toHaveBeenCalled();
   });
 
+  it("names the logged-in account when the station carries no member identity", async () => {
+    const { internals, rtc, devices } = fixture();
+    devices[0]!.raw = { device_type: DeviceType.STATION_9000 };
+    const mega = (internals as unknown as { mega: { rtcIdentity(): unknown } }).mega;
+    vi.spyOn(mega, "rtcIdentity").mockReturnValue({ authToken: "t", userId: "synthetic-login", gtoken: "g" });
+    await internals.routeCommand(HUB, command);
+    expect(rtc).toHaveBeenCalledExactlyOnceWith(
+      { stationSn: HUB, adminUserId: "synthetic-login", attached: false },
+      command,
+    );
+  });
+
   it("keeps another station family on its existing transport", async () => {
-    const { internals, rtc, p2p } = fixture("T8030");
+    const { internals, rtc, p2p } = fixture(DeviceType.HB3);
     await internals.routeCommand(CAMERA, command);
     expect(p2p).toHaveBeenCalledExactlyOnceWith(CAMERA, command);
     expect(rtc).not.toHaveBeenCalled();

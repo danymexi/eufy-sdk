@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import type { RtcPeer, TurnConfig } from "../peer.js";
-import { scallJsonToSdp } from "../scall-sdp.js";
-import { MAX_CALL_RETRIES, RtcSession } from "../session.js";
+import { scallJsonToSdp, sdpToScallJson } from "../scall-sdp.js";
+import { RtcSession } from "../session.js";
 import type { RtcInnerMessage, RtcSignalingClient } from "../signaling.js";
 
 class FakeSignaling extends EventEmitter {
@@ -27,14 +27,14 @@ class FakeSignaling extends EventEmitter {
 
 class FakePeer extends EventEmitter {
   init = vi.fn(async (_turn?: TurnConfig) => {});
-  handleRemoteOffer = vi.fn(async (sdp: string) => `ANSWER<${sdp.length}>`);
-  answerAsScallJson = vi.fn((sdp: string) => JSON.stringify({ answer: sdp }));
+  handleRemoteOffer = vi.fn(async (_sdp: string) => ANSWER);
   addRemoteCandidate = vi.fn();
   sendCommand = vi.fn(() => true);
   close = vi.fn();
   isCommandChannelReady = false;
 }
 
+const ANSWER = "v=0\r\na=setup:active\r\na=ice-ufrag:x\r\na=ice-pwd:y\r\na=fingerprint:sha-256 aa:bb\r\n";
 const TURN: TurnConfig = { turn_addr: "203.0.113.30", turn_port: 3478, turn_user: "u", turn_password: "p" };
 const HUB_SDP = {
   setup: "actpass",
@@ -45,7 +45,6 @@ const HUB_SDP = {
 function setup() {
   const sig = new FakeSignaling();
   const peer = new FakePeer();
-  const sleeps: number[] = [];
   const session = new RtcSession({
     authToken: "T",
     gtoken: "G",
@@ -55,13 +54,10 @@ function setup() {
     country: "IT",
     createSignaling: () => sig as unknown as RtcSignalingClient,
     createPeer: () => peer as unknown as RtcPeer,
-    sleep: async (ms) => {
-      sleeps.push(ms);
-    },
   });
   const errors: Error[] = [];
   session.on("error", (e) => errors.push(e));
-  return { sig, peer, session, sleeps, errors };
+  return { sig, peer, session, errors };
 }
 
 async function authenticated(s: ReturnType<typeof setup>) {
@@ -84,7 +80,7 @@ describe("RtcSession", () => {
     s.sig.hub({ action: 3, code: 200, dataType: "scall", data: { status: 100, turn: TURN } }); // not auth
     s.sig.hub({ action: 1, code: 200 });
     await connecting;
-    expect(s.sig.sendCall).toHaveBeenCalledWith(0);
+    expect(s.sig.sendCall).toHaveBeenCalledTimes(1);
   });
 
   it("times out when the hub never authenticates", async () => {
@@ -102,11 +98,8 @@ describe("RtcSession", () => {
 
   it("runs the whole exchange: grant → offer → answer → trickle → ack → open", async () => {
     const s = await authenticated(setup());
-    const turn = vi.fn();
-    s.session.on("turn", turn);
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });
     await flush();
-    expect(turn).toHaveBeenCalledWith(TURN);
     expect(s.peer.init).toHaveBeenCalledWith(TURN);
 
     s.sig.hub({ action: 3, dataType: "info", data: { sdp: JSON.stringify(HUB_SDP) } });
@@ -114,7 +107,7 @@ describe("RtcSession", () => {
     const offered = s.peer.handleRemoteOffer.mock.calls[0]![0];
     expect(offered).toContain("a=ice-ufrag:a");
     expect(offered).toBe(scallJsonToSdp(HUB_SDP, () => Number(offered.match(/o=- (\d+)/)![1])));
-    expect(s.sig.sendInfoSdp).toHaveBeenCalledWith(JSON.stringify({ answer: `ANSWER<${offered.length}>` }), 0);
+    expect(s.sig.sendInfoSdp).toHaveBeenCalledWith(JSON.stringify(sdpToScallJson(ANSWER)));
     // A second offer is ignored.
     s.sig.hub({ action: 3, dataType: "info", data: { sdp: JSON.stringify(HUB_SDP) } });
     await flush();
@@ -135,16 +128,11 @@ describe("RtcSession", () => {
 
     s.peer.emit("iceCandidate", "our-host");
     s.peer.emit("iceGatheringComplete");
-    // Candidates ride the session's own channel (0 here) — the same channel the SDP answer and ack use,
-    // matching the portal, not a fixed channel 1.
-    expect(s.sig.sendInfoCandidate.mock.calls).toEqual([
-      ["our-host", 0],
-      ["", 0],
-    ]);
+    expect(s.sig.sendInfoCandidate.mock.calls).toEqual([["our-host"], [""]]);
 
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 200 } });
     await flush();
-    expect(s.sig.sendAck).toHaveBeenCalledWith(0);
+    expect(s.sig.sendAck).toHaveBeenCalledTimes(1);
 
     const connected = vi.fn();
     s.session.on("connected", connected);
@@ -155,7 +143,7 @@ describe("RtcSession", () => {
 
     const frames: Array<[string, number]> = [];
     s.session.on("commandData", (f, lt) => frames.push([f.toString(), lt]));
-    s.peer.emit("data", "notify", Buffer.from("XZYH"), 3);
+    s.peer.emit("data", Buffer.from("XZYH"), 3);
     expect(frames).toEqual([["XZYH", 3]]);
     expect(s.session.sendCommand(Buffer.from("XZYH"))).toBe(true);
     expect(s.errors).toEqual([]);
@@ -174,21 +162,28 @@ describe("RtcSession", () => {
     expect(s.peer.handleRemoteOffer).toHaveBeenCalledTimes(1);
   });
 
-  it("backs off and calls again on 486/408, then gives up", async () => {
+  it.each([486, 408])("fails the session on scall %s instead of calling again", async (status) => {
     const s = await authenticated(setup());
-    const statuses = [486, 408, 486];
-    for (const [i, status] of statuses.entries()) {
-      s.sig.hub({ action: 3, dataType: "scall", data: { status } });
-      await flush();
-      expect(s.sig.sendCall).toHaveBeenCalledTimes(i + 2);
-    }
-    expect(s.sig.sendHangup).toHaveBeenCalledTimes(3);
-    expect(s.peer.close).toHaveBeenCalledTimes(3);
-    expect(s.sleeps).toEqual([10_000, 15_000, 20_000]);
-    s.sig.hub({ action: 3, dataType: "scall", data: { status: 486 } });
+    const closed = vi.fn();
+    s.session.on("close", closed);
+    s.sig.hub({ action: 3, dataType: "scall", data: { status } });
     await flush();
-    expect(s.sig.sendCall).toHaveBeenCalledTimes(MAX_CALL_RETRIES + 1);
-    expect(s.errors.map((e) => e.message)).toEqual([`RTC scall 486 after ${MAX_CALL_RETRIES} retries`]);
+    expect(s.sig.sendCall).toHaveBeenCalledTimes(1);
+    expect(s.errors.map((e) => e.message)).toEqual([`RTC T9000P0000000001 scall answered ${status}`]);
+    expect(closed).toHaveBeenCalledTimes(1);
+    expect(s.sig.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("announces close once when the caller closes it, so a waiter is released at once", async () => {
+    const s = await authenticated(setup());
+    s.peer.emit("commandChannelOpen");
+    const closed = vi.fn();
+    s.session.on("close", closed);
+    s.session.close();
+    expect(closed).toHaveBeenCalledTimes(1);
+    s.sig.emit("close", 1000, "");
+    s.peer.emit("commandChannelClosed");
+    expect(closed).toHaveBeenCalledTimes(1);
   });
 
   it("reports a lost peer or socket as close, and close() hangs up both sides once", async () => {

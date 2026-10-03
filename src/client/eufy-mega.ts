@@ -76,7 +76,7 @@ import {
   type DeviceInspection,
   type RawParams,
 } from "../model/index.js";
-import { isHomeBase } from "../model/device-family.js";
+import { isHomeBase, isStation9000 } from "../model/device-family.js";
 import { cameraPowerTier } from "../model/capabilities/battery.js";
 import { DeviceRegistry, type ParamChange } from "./device-registry.js";
 import type {
@@ -370,7 +370,6 @@ export class EufyMega extends EventEmitter {
       identity: () => this.mega.rtcIdentity(),
       shard: () => this.mega.rtcShard,
       country: opts.countryCode,
-      findDevice: (sn) => this.registry.list().find((d) => d.sn === sn),
       logger: opts.logger,
       onError: (e) => this.reportError(e),
     });
@@ -1143,18 +1142,18 @@ export class EufyMega extends EventEmitter {
     }
     const devices = this.registry.list();
     const target = devices.find((d) => d.sn === sn);
-    if (
-      target &&
-      (RtcCommandRouter.claimsDevice(target) ||
-        RtcCommandRouter.claimsAttached(target, (stationSn) => devices.find((d) => d.sn === stationSn)))
-    ) {
-      if (
-        target.stationSn &&
-        target.stationSn !== sn &&
-        this.registry.serialForFrame(target.stationSn, cmd.channel) !== sn
-      )
+    const stationSn = target?.stationSn || sn;
+    const station = devices.find((d) => d.sn === stationSn);
+    const stationRaw = (station?.raw ?? {}) as { device_type?: unknown; member?: { admin_user_id?: unknown } };
+    const deviceType = typeof stationRaw.device_type === "number" ? stationRaw.device_type : undefined;
+    if (target && station && isStation9000({ deviceType, model: station.model })) {
+      const attached = stationSn !== sn;
+      if (attached && this.registry.serialForFrame(stationSn, cmd.channel) !== sn)
         return Promise.reject(new Error("RTC command requires an unambiguous attached-device channel"));
-      return this.rtc.dispatchCommand(sn, cmd);
+      const member = stationRaw.member?.admin_user_id;
+      const adminUserId = (typeof member === "string" && member) || this.mega.rtcIdentity()?.userId;
+      if (!adminUserId) return Promise.reject(new Error(`rtc: not logged in, cannot drive ${sn}`));
+      return this.rtc.dispatchCommand({ stationSn, adminUserId, attached }, cmd);
     }
     return this.p2p.dispatchCommand(sn, cmd);
   }
