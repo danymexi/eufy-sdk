@@ -257,6 +257,12 @@ export interface AvailabilityContext {
    * cannot do what its name promises there.
    */
   homeBaseAttached?: boolean;
+  /**
+   * The vendor DeviceType of the station the device hangs off (its `parent_sn`), when it is attached
+   * and the station's record states one. Answers which station family a command addressed to an
+   * attached device is carried through.
+   */
+  stationDeviceType?: number;
 }
 
 export interface CommandContext extends AvailabilityContext {
