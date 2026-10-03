@@ -1318,20 +1318,43 @@ export class EufyMega extends EventEmitter {
 
   /** Inject the optional portal frame reader without acquiring a session or fetching a record. */
   private portalPayloadReaderFor(sn: string, ctx: CommandContext): PortalPayloadReader | undefined {
-    const dev = this.registry.list().find((entry) => entry.sn === sn);
-    if (!dev || !RtcCommandRouter.claimsDevice(dev)) return undefined;
+    const qualifies = (dev: EufyDevice | undefined): dev is EufyDevice => {
+      if (!dev || dev.model !== "T9000" || (dev.stationSn && dev.stationSn !== sn)) return false;
+      const raw = (dev.raw ?? {}) as Record<string, unknown>;
+      const deviceType = typeof raw.device_type === "number" ? raw.device_type : undefined;
+      return isStation9000({ deviceType, model: dev.model });
+    };
+    const find = () => this.registry.list().find((entry) => entry.sn === sn);
+    if (!qualifies(find())) return undefined;
+    const adminFor = (dev: EufyDevice) => {
+      const raw = dev.raw as { member?: { admin_user_id?: unknown } } | undefined;
+      const admin = raw?.member?.admin_user_id;
+      return (typeof admin === "string" && admin) || this.mega.rtcIdentity()?.userId;
+    };
     return {
       readPayload: (intent, signal) => {
-        const current = this.registry.list().find((entry) => entry.sn === sn);
-        const raw = (current?.raw ?? {}) as Record<string, unknown>;
+        const current = find();
         if (
-          !current ||
-          !RtcCommandRouter.claimsDevice(current) ||
+          !qualifies(current) ||
           current.model !== ctx.model ||
-          recordString(raw, "main_sw_version") !== ctx.firmwareVersion
+          recordString((current.raw ?? {}) as Record<string, unknown>, "main_sw_version") !== ctx.firmwareVersion
         )
           return Promise.reject(new Error("rtc: payload reader device record changed"));
-        return this.rtc.readPayload(sn, intent, signal);
+        const stationSn = current.stationSn;
+        const adminUserId = adminFor(current);
+        if (!adminUserId) return Promise.reject(new Error("rtc: payload read requires a known logged-in station"));
+        const isRecordCurrent = () => {
+          const latest = find();
+          return (
+            latest === current &&
+            latest.stationSn === stationSn &&
+            qualifies(latest) &&
+            latest.model === ctx.model &&
+            recordString((latest.raw ?? {}) as Record<string, unknown>, "main_sw_version") === ctx.firmwareVersion &&
+            adminFor(latest) === adminUserId
+          );
+        };
+        return this.rtc.readPayload({ stationSn: sn, adminUserId }, intent, isRecordCurrent, signal);
       },
     };
   }

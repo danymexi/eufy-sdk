@@ -2,14 +2,14 @@ import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Command } from "../../../core/contracts.js";
 import type { EufyDevice } from "../../../core/types.js";
-import { RtcCommandRouter, type RtcIdentity } from "../command-router.js";
+import { RtcCommandRouter, type RtcIdentity, type RtcRoute } from "../command-router.js";
 import { buildPortalHeader, buildPortalPacket, parsePortalHeader, PORTAL_HEADER_LENGTH } from "../portal-packet.js";
 import type { RtcSession, RtcSessionOptions } from "../session.js";
 
 /** Synthetic station and child identifiers for isolated router ownership. */
 const STATION = "T9000P0000000000";
-/** Synthetic attached-device identifier. */
-const CHILD = "T8000P0000000001";
+/** Caller-resolved route, with no device lookup in the transport. */
+const ROUTE: RtcRoute = { stationSn: STATION, adminUserId: "synthetic-admin", attached: false };
 /** A neutral payload read request with a station-local channel. */
 const READ: Extract<Command, { kind: "set-payload" }> = {
   kind: "set-payload",
@@ -88,17 +88,20 @@ class SyntheticSession extends EventEmitter {
     }
   }
 }
-/** Build a router over mutable synthetic account and device records. */
+/** Build a router with account ownership and caller-supplied record validity. */
 function fixture(nestedFirmware = false, connectionDelay = 0) {
   const state = {
     identity: { authToken: "synthetic-token", userId: "synthetic-user", gtoken: "synthetic-gtoken" } as
       RtcIdentity | undefined,
     shard: "us-pr",
+    current: true,
+    adminUserId: "synthetic-admin",
     device: {
       sn: STATION,
       model: "T9000",
       stationSn: STATION,
       raw: {
+        device_type: 27,
         member: { admin_user_id: "synthetic-admin" },
         ...(nestedFirmware ? { deviceParams: { main_sw_version: "4.4.0.4" } } : { main_sw_version: "4.4.0.4" }),
       },
@@ -114,22 +117,38 @@ function fixture(nestedFirmware = false, connectionDelay = 0) {
   const router = new RtcCommandRouter({
     identity: () => state.identity,
     shard: () => state.shard,
-    findDevice: (sn) =>
-      sn === STATION
-        ? state.device
-        : sn === CHILD
-          ? ({ sn: CHILD, model: "T8425", stationSn: STATION, raw: {} } as EufyDevice)
-          : undefined,
     createSession,
   });
   routers.push(router);
   const connect = async () => {
-    await router.dispatchCommand(STATION, CONTROL);
+    await router.dispatchCommand(ROUTE, CONTROL);
     const session = sessions[0]!;
     session.autoAck = false;
     return session;
   };
-  return { state, router, sessions, createSession, connect };
+  const validities: ReturnType<typeof vi.fn<() => boolean>>[] = [];
+  const read = (intent = READ, signal?: AbortSignal) => {
+    const record = state.device;
+    const model = record.model;
+    const parent = record.stationSn;
+    const firmware = (device: EufyDevice) => {
+      const raw = device.raw as { main_sw_version?: string; deviceParams?: { main_sw_version?: string } };
+      return raw.deviceParams?.main_sw_version ?? raw.main_sw_version;
+    };
+    const version = firmware(record);
+    const isRecordCurrent = vi.fn(
+      () =>
+        state.current &&
+        state.device === record &&
+        state.device.sn === STATION &&
+        state.device.model === model &&
+        state.device.stationSn === parent &&
+        firmware(state.device) === version,
+    );
+    validities.push(isRecordCurrent);
+    return router.readPayload({ stationSn: STATION, adminUserId: state.adminUserId }, intent, isRecordCurrent, signal);
+  };
+  return { state, router, sessions, createSession, connect, read, validities };
 }
 /** Keep teardown independent of which assertion ends a case. */
 const routers: RtcCommandRouter[] = [];
@@ -142,18 +161,23 @@ afterEach(() => {
 });
 
 describe("explicit shared-owner payload read routing", () => {
-  it.each([CHILD, "T9000P0000000099"])(
-    "does not acquire a station session for an unsupported read of %s",
-    async (sn) => {
+  it.each(["logout", "missing station", "missing admin", "invalid caller record"])(
+    "does not acquire a station session for %s",
+    async (change) => {
       const f = fixture();
-      await expect(f.router.readPayload(sn, READ)).rejects.toThrow("known logged-in station");
+      if (change === "logout") f.state.identity = undefined;
+      if (change === "missing admin") f.state.adminUserId = "";
+      if (change === "invalid caller record") f.state.current = false;
+      const pending =
+        change === "missing station" ? f.router.readPayload({ ...ROUTE, stationSn: "" }, READ, () => true) : f.read();
+      await expect(pending).rejects.toThrow("known logged-in station");
       expect(f.createSession).not.toHaveBeenCalled();
     },
   );
 
   it("acquires one station session for an explicit read without an unrelated control write", async () => {
     const f = fixture();
-    const read = f.router.readPayload(STATION, READ);
+    const read = f.read();
     await vi.advanceTimersByTimeAsync(0);
     expect(f.sessions).toHaveLength(1);
     const session = f.sessions[0]!;
@@ -161,13 +185,26 @@ describe("explicit shared-owner payload read routing", () => {
     session.notify();
     await read;
     expect(f.createSession).toHaveBeenCalledTimes(1);
+    expect(f.validities[0]).toHaveBeenCalled();
+  });
+
+  it("uses caller validity without interpreting the caller's device metadata", async () => {
+    const f = fixture();
+    f.state.device.model = "T8030";
+    f.state.device.raw = { device_type: 26, main_sw_version: "synthetic-other" };
+    const read = f.read();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.sessions).toHaveLength(1);
+    f.sessions[0]!.notify();
+    await expect(read).resolves.toMatchObject({ exactlyCorrelated: false });
+    expect(f.validities[0]).toHaveBeenCalled();
   });
 
   it("acquires nothing for a pre-aborted explicit read", async () => {
     const f = fixture();
     const abort = new AbortController();
     abort.abort();
-    await expect(f.router.readPayload(STATION, READ, abort.signal)).rejects.toThrow("aborted");
+    await expect(f.read(READ, abort.signal)).rejects.toThrow("aborted");
     expect(f.createSession).not.toHaveBeenCalled();
   });
 
@@ -175,7 +212,7 @@ describe("explicit shared-owner payload read routing", () => {
     const f = fixture();
     const session = await f.connect();
     session.connected = false;
-    const read = f.router.readPayload(STATION, READ);
+    const read = f.read();
     await vi.advanceTimersByTimeAsync(0);
     f.sessions[1]!.notify();
     await read;
@@ -186,7 +223,7 @@ describe("explicit shared-owner payload read routing", () => {
   it("sends one read envelope on the requested channel with the existing admin owner", async () => {
     const f = fixture();
     const session = await f.connect();
-    const read = f.router.readPayload(STATION, READ);
+    const read = f.read();
     await vi.advanceTimersByTimeAsync(0);
     expect(session.sent).toHaveLength(2);
     const packet = session.sent[1]!;
@@ -208,10 +245,10 @@ describe("explicit shared-owner payload read routing", () => {
   it("refuses concurrent reads while queuing ordinary writes after the active read", async () => {
     const f = fixture();
     const session = await f.connect();
-    const read = f.router.readPayload(STATION, READ);
+    const read = f.read();
     await vi.advanceTimersByTimeAsync(0);
-    await expect(f.router.readPayload(STATION, READ)).rejects.toThrow("idle station session");
-    const write = f.router.dispatchCommand(STATION, CONTROL);
+    await expect(f.read()).rejects.toThrow("idle station session");
+    const write = f.router.dispatchCommand(ROUTE, CONTROL);
     await vi.advanceTimersByTimeAsync(0);
     expect(session.sent).toHaveLength(2);
     session.notify();
@@ -228,9 +265,9 @@ describe("explicit shared-owner payload read routing", () => {
   it("refuses a read while an ordinary control is awaiting its ACK", async () => {
     const f = fixture();
     const session = await f.connect();
-    const write = f.router.dispatchCommand(STATION, CONTROL);
+    const write = f.router.dispatchCommand(ROUTE, CONTROL);
     await vi.advanceTimersByTimeAsync(0);
-    await expect(f.router.readPayload(STATION, READ)).rejects.toThrow("idle station session");
+    await expect(f.read()).rejects.toThrow("idle station session");
     expect(session.sent).toHaveLength(2);
     session.ack();
     await write;
@@ -242,24 +279,21 @@ describe("explicit shared-owner payload read routing", () => {
       const f = fixture();
       const session = await f.connect();
       if (change === "logout") f.state.identity = undefined;
-      else if (change === "admin")
-        f.state.device.raw = { main_sw_version: "4.4.0.4", member: { admin_user_id: "synthetic-other-admin" } };
+      else if (change === "admin") f.state.adminUserId = "synthetic-other-admin";
       else if (change === "shard") f.state.shard = "eu-pr";
       else f.state.identity![change as keyof RtcIdentity] = "synthetic-other";
-      await expect(f.router.readPayload(STATION, READ)).rejects.toThrow(
-        change === "logout" ? "known logged-in station" : "owner changed",
-      );
+      await expect(f.read()).rejects.toThrow(change === "logout" ? "known logged-in station" : "owner changed");
       expect(session.sent).toHaveLength(1);
       expect(f.createSession).toHaveBeenCalledTimes(1);
     },
   );
 
-  it.each(["model", "firmware", "nested firmware", "identity", "disconnect", "record removed"])(
+  it.each(["model", "firmware", "nested firmware", "identity", "disconnect", "record removed", "caller invalid"])(
     "invalidates an active read when %s changes",
     async (change) => {
       const f = fixture(change === "nested firmware");
       const session = await f.connect();
-      const read = f.router.readPayload(STATION, READ);
+      const read = f.read();
       const assertion = expect(read).rejects.toThrow("owner changed");
       await vi.advanceTimersByTimeAsync(0);
       session.notify();
@@ -272,6 +306,7 @@ describe("explicit shared-owner payload read routing", () => {
           deviceParams: { main_sw_version: "synthetic-other" },
         };
       if (change === "identity") f.state.identity!.authToken = "synthetic-other";
+      if (change === "caller invalid") f.state.current = false;
       if (change === "disconnect") session.connected = false;
       if (change === "record removed") f.state.device = { ...f.state.device, sn: "T9000P0000000099", model: "T8030" };
       session.ack();
@@ -283,49 +318,59 @@ describe("explicit shared-owner payload read routing", () => {
     },
   );
 
-  it.each(["model", "firmware", "nested firmware", "authToken", "admin", "shard", "logout", "record replacement"])(
-    "rejects an acquisition-time %s change before sending any payload",
-    async (change) => {
-      const f = fixture(change === "nested firmware", 5_000);
-      const read = f.router.readPayload(STATION, READ);
-      const assertion = expect(read).rejects.toThrow("owner changed");
-      await vi.advanceTimersByTimeAsync(0);
-      const session = f.sessions[0]!;
-      expect(session.isConnected).toBe(false);
-      expect(session.sent).toHaveLength(0);
-      if (change === "model") f.state.device.model = "T9000-synthetic-other";
-      if (change === "firmware")
-        f.state.device.raw = { ...(f.state.device.raw as object), main_sw_version: "synthetic-other" };
-      if (change === "nested firmware")
-        f.state.device.raw = {
-          member: { admin_user_id: "synthetic-admin" },
-          deviceParams: { main_sw_version: "synthetic-other" },
-        };
-      if (change === "authToken") f.state.identity!.authToken = "synthetic-other";
-      if (change === "admin")
-        f.state.device.raw = { main_sw_version: "4.4.0.4", member: { admin_user_id: "synthetic-other-admin" } };
-      if (change === "shard") f.state.shard = "eu-pr";
-      if (change === "logout") f.state.identity = undefined;
-      if (change === "record replacement") f.state.device = { ...f.state.device };
-      await vi.advanceTimersByTimeAsync(5_000);
-      await assertion;
-      expect(session.sent).toHaveLength(0);
-      expect(f.createSession).toHaveBeenCalledTimes(1);
-      expect(session.isConnected).toBe(true);
-      expect(session.closes).toBe(0);
-      expect(session.listenerCount("commandData")).toBe(0);
-      expect(session.listenerCount("close")).toBe(1);
-      expect(session.listenerCount("error")).toBe(1);
-      expect(vi.getTimerCount()).toBe(1);
-    },
-  );
+  it.each([
+    "model",
+    "firmware",
+    "nested firmware",
+    "authToken",
+    "admin",
+    "shard",
+    "logout",
+    "record replacement",
+    "caller invalid",
+  ])("rejects an acquisition-time %s change before sending any payload", async (change) => {
+    const f = fixture(change === "nested firmware", 5_000);
+    const read = f.read();
+    const assertion = expect(read).rejects.toThrow("owner changed");
+    await vi.advanceTimersByTimeAsync(0);
+    const session = f.sessions[0]!;
+    expect(session.isConnected).toBe(false);
+    expect(session.sent).toHaveLength(0);
+    if (change === "model") f.state.device.model = "T9000-synthetic-other";
+    if (change === "firmware")
+      f.state.device.raw = { ...(f.state.device.raw as object), main_sw_version: "synthetic-other" };
+    if (change === "nested firmware")
+      f.state.device.raw = {
+        member: { admin_user_id: "synthetic-admin" },
+        deviceParams: { main_sw_version: "synthetic-other" },
+      };
+    if (change === "authToken") f.state.identity!.authToken = "synthetic-other";
+    if (change === "caller invalid") f.state.current = false;
+    if (change === "admin") {
+      f.state.adminUserId = "synthetic-other-admin";
+      f.state.current = false;
+    }
+    if (change === "shard") f.state.shard = "eu-pr";
+    if (change === "logout") f.state.identity = undefined;
+    if (change === "record replacement") f.state.device = { ...f.state.device };
+    await vi.advanceTimersByTimeAsync(5_000);
+    await assertion;
+    expect(session.sent).toHaveLength(0);
+    expect(f.createSession).toHaveBeenCalledTimes(1);
+    expect(session.isConnected).toBe(true);
+    expect(session.closes).toBe(0);
+    expect(session.listenerCount("commandData")).toBe(0);
+    expect(session.listenerCount("close")).toBe(1);
+    expect(session.listenerCount("error")).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+  });
 
   it("refuses a shared acquisition read when an ordinary waiting write wins admission", async () => {
     const f = fixture(false, 5_000);
-    const write = f.router.dispatchCommand(STATION, CONTROL);
+    const write = f.router.dispatchCommand(ROUTE, CONTROL);
     const session = f.sessions[0]!;
     session.autoAck = false;
-    const read = f.router.readPayload(STATION, READ);
+    const read = f.read();
     const assertion = expect(read).rejects.toThrow("idle station session");
     await vi.advanceTimersByTimeAsync(5_000);
     await assertion;
@@ -343,12 +388,12 @@ describe("explicit shared-owner payload read routing", () => {
     const f = fixture();
     const session = await f.connect();
     const abort = new AbortController();
-    const first = f.router.readPayload(STATION, READ, abort.signal);
+    const first = f.read(READ, abort.signal);
     const assertion = expect(first).rejects.toThrow("aborted");
     await vi.advanceTimersByTimeAsync(0);
     abort.abort();
     await assertion;
-    const next = f.router.readPayload(STATION, READ);
+    const next = f.read();
     await vi.advanceTimersByTimeAsync(0);
     session.ack(session.sent[1]!);
     session.notify();
@@ -362,14 +407,14 @@ describe("explicit shared-owner payload read routing", () => {
   it.each([-1, 1.5, 256, NaN])("refuses invalid read channel %s before sending", async (channel) => {
     const f = fixture();
     const session = await f.connect();
-    await expect(f.router.readPayload(STATION, { ...READ, channel })).rejects.toThrow("valid channel");
+    await expect(f.read({ ...READ, channel })).rejects.toThrow("valid channel");
     expect(session.sent).toHaveLength(1);
   });
 
   it("admits only one concurrent cold read on the shared owner", async () => {
     const f = fixture();
-    const first = f.router.readPayload(STATION, READ);
-    const second = f.router.readPayload(STATION, READ);
+    const first = f.read();
+    const second = f.read();
     const refusal = expect(second).rejects.toThrow("idle station session");
     await vi.advanceTimersByTimeAsync(0);
     await refusal;
@@ -381,7 +426,7 @@ describe("explicit shared-owner payload read routing", () => {
 
   it("bounds connection plus exchange to 15 seconds rather than resetting the deadline after acquisition", async () => {
     const f = fixture(false, 11_900);
-    const read = f.router.readPayload(STATION, READ);
+    const read = f.read();
     const assertion = expect(read).rejects.toThrow("aborted");
     await vi.advanceTimersByTimeAsync(11_900);
     const session = f.sessions[0]!;
@@ -397,7 +442,7 @@ describe("explicit shared-owner payload read routing", () => {
 
   it("keeps the existing 12-second connection bound inside the read budget", async () => {
     const f = fixture(false, 20_000);
-    const read = f.router.readPayload(STATION, READ);
+    const read = f.read();
     const assertion = expect(read).rejects.toThrow("did not come up within 12000ms");
     await vi.advanceTimersByTimeAsync(12_000);
     await assertion;
@@ -408,9 +453,9 @@ describe("explicit shared-owner payload read routing", () => {
   it("cancels one acquisition wait without closing the shared owner or an ordinary waiting write", async () => {
     const f = fixture(false, 5_000);
     const abort = new AbortController();
-    const read = f.router.readPayload(STATION, READ, abort.signal);
+    const read = f.read(READ, abort.signal);
     const assertion = expect(read).rejects.toThrow("aborted");
-    const write = f.router.dispatchCommand(STATION, CONTROL);
+    const write = f.router.dispatchCommand(ROUTE, CONTROL);
     await vi.advanceTimersByTimeAsync(0);
     abort.abort();
     await assertion;

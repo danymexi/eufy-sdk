@@ -113,17 +113,19 @@ export class RtcCommandRouter {
   }
 
   /** Explicit payload read; shares the normal station owner and bounds acquisition plus exchange to 15 seconds. */
-  async readPayload(sn: string, intent: Extract<Command, { kind: "set-payload" }>, signal?: AbortSignal) {
-    const dev = this.deps.findDevice(sn);
+  async readPayload(
+    route: Pick<RtcRoute, "stationSn" | "adminUserId">,
+    intent: Extract<Command, { kind: "set-payload" }>,
+    isRecordCurrent: () => boolean,
+    signal?: AbortSignal,
+  ) {
+    const { stationSn: sn, adminUserId } = route;
     const identity = this.deps.identity();
-    const adminUserId = this.adminUserId(dev, identity);
-    if (!identity || !adminUserId || !dev || !RtcCommandRouter.claimsDevice(dev))
+    if (!identity || !sn || !adminUserId || !isRecordCurrent())
       throw new Error("rtc: payload read requires a known logged-in station");
     if (signal?.aborted) throw new Error("rtc: payload read aborted");
     if (!Number.isInteger(intent.channel) || intent.channel < 0 || intent.channel > 255)
       throw new RangeError("rtc: payload read requires a valid channel");
-    const model = dev.model;
-    const firmware = this.firmware(dev);
     const caller = { ...identity, adminUserId, shard: this.deps.shard() };
     const abort = new AbortController();
     const onAbort = () => abort.abort();
@@ -134,20 +136,15 @@ export class RtcCommandRouter {
       if (existing?.pending) throw new Error("rtc: payload read requires an idle station session");
       const st = await awaitPayloadOwner(this.stationSession(sn, adminUserId, identity), abort.signal);
       const isCurrent = () => {
-        const current = this.deps.findDevice(sn);
         const auth = this.deps.identity();
         return (
           this.sessions.get(sn) === st &&
           st.session.isConnected &&
-          current === dev &&
-          RtcCommandRouter.claimsDevice(current) &&
-          current.model === model &&
-          this.firmware(current) === firmware &&
+          isRecordCurrent() &&
           !!auth &&
           auth.authToken === st.owner.authToken &&
           auth.userId === st.owner.userId &&
           auth.gtoken === st.owner.gtoken &&
-          this.adminUserId(current, auth) === st.owner.adminUserId &&
           caller.authToken === st.owner.authToken &&
           caller.userId === st.owner.userId &&
           caller.gtoken === st.owner.gtoken &&
@@ -195,20 +192,6 @@ export class RtcCommandRouter {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     }
-  }
-
-  /** Resolve the current owner without fetching device metadata. */
-  private adminUserId(dev: EufyDevice | undefined, identity: RtcIdentity | undefined): string | undefined {
-    const member = (dev?.raw as { member?: { admin_user_id?: unknown } } | undefined)?.member;
-    return (typeof member?.admin_user_id === "string" && member.admin_user_id) || identity?.userId;
-  }
-
-  /** The record's firmware generation qualifies a read's lifetime, not its payload semantics. */
-  private firmware(dev: EufyDevice): unknown {
-    const raw = dev.raw as { main_sw_version?: unknown; deviceParams?: { main_sw_version?: unknown } } | undefined;
-    const nested = raw?.deviceParams?.main_sw_version;
-    const value = typeof nested === "string" && nested ? nested : raw?.main_sw_version;
-    return typeof value === "string" && value ? value : undefined;
   }
 
   /** Tear down every station session (logout / shutdown). */
