@@ -47,16 +47,16 @@ describe("station-owned RTC command routing", () => {
     expect(p2p).not.toHaveBeenCalled();
   });
 
-  it("names the logged-in account when the station carries no member identity", async () => {
+  it("leaves absent station member identity to the RTC router", async () => {
     const { internals, rtc, devices } = fixture();
     devices[0]!.raw = { device_type: DeviceType.STATION_9000 };
     const mega = (internals as unknown as { mega: { rtcIdentity(): unknown } }).mega;
-    vi.spyOn(mega, "rtcIdentity").mockReturnValue({ authToken: "t", userId: "synthetic-login", gtoken: "g" });
+    const identity = vi
+      .spyOn(mega, "rtcIdentity")
+      .mockReturnValue({ authToken: "t", userId: "synthetic-login", gtoken: "g" });
     await internals.routeCommand(HUB, command);
-    expect(rtc).toHaveBeenCalledExactlyOnceWith(
-      { stationSn: HUB, adminUserId: "synthetic-login", attached: false },
-      command,
-    );
+    expect(rtc).toHaveBeenCalledExactlyOnceWith({ stationSn: HUB, adminUserId: undefined, attached: false }, command);
+    expect(identity).not.toHaveBeenCalled();
   });
 
   it("keeps another station family on its existing transport", async () => {

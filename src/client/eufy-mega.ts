@@ -1145,8 +1145,7 @@ export class EufyMega extends EventEmitter {
       if (attached && this.registry.serialForFrame(stationSn, cmd.channel) !== sn)
         return Promise.reject(new Error("RTC command requires an unambiguous attached-device channel"));
       const member = stationRaw.member?.admin_user_id;
-      const adminUserId = (typeof member === "string" && member) || this.mega.rtcIdentity()?.userId;
-      if (!adminUserId) return Promise.reject(new Error(`rtc: not logged in, cannot drive ${sn}`));
+      const adminUserId = typeof member === "string" ? member : undefined;
       return this.rtc.dispatchCommand({ stationSn, adminUserId, attached }, cmd);
     }
     return this.p2p.dispatchCommand(sn, cmd);

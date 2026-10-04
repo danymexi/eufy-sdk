@@ -49,8 +49,8 @@ export interface RtcIdentity {
 /** Where a command goes: the station's session, and whether it addresses the station or a device on it. */
 export interface RtcRoute {
   stationSn: string;
-  /** The station's `member.admin_user_id`, the account the session and the payload name. */
-  adminUserId: string;
+  /** The station's `member.admin_user_id`; defaults to the logged-in account when absent. */
+  adminUserId?: string;
   /** True for a device attached to the station, which keeps the command's own channel. */
   attached: boolean;
 }
@@ -87,7 +87,8 @@ export class RtcCommandRouter {
     }
     const identity = this.deps.identity();
     if (!identity) throw new Error(`rtc: not logged in, cannot drive ${route.stationSn}`);
-    const { stationSn, adminUserId } = route;
+    const { stationSn } = route;
+    const adminUserId = route.adminUserId || identity.userId;
     const channel = route.attached ? cmd.channel : PORTAL_STATION_CHANNEL;
     const st = await this.stationSession(stationSn, adminUserId, identity);
     const outerCmd = cmd.kind === "set-json" ? PORTAL_CMD_CONTROL_PAYLOAD : PORTAL_CMD_SET_PAYLOAD;

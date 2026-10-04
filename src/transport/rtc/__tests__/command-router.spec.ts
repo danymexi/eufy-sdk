@@ -151,6 +151,23 @@ describe("RtcCommandRouter", () => {
     });
   });
 
+  it("uses the logged-in account for session and payload when the station member identity is absent", async () => {
+    const { router, sessions } = makeRouter();
+    try {
+      await router.dispatchCommand({ stationSn: SN, attached: false }, arming(1));
+      const session = sessions[0]!;
+      expect({
+        sessionAccount: session.opts.adminUserId,
+        payloadAccount: sent(session.sent[0]!).body.account_id,
+      }).toEqual({
+        sessionAccount: "uid",
+        payloadAccount: "uid",
+      });
+    } finally {
+      router.close();
+    }
+  });
+
   it("reuses the station session across commands and serialises them", async () => {
     const { router, sessions } = makeRouter();
     await Promise.all([router.dispatchCommand(ST, arming(1)), router.dispatchCommand(ST, arming(2))]);

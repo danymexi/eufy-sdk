@@ -96,6 +96,40 @@ describe("RtcSession", () => {
     }
   });
 
+  it("rejects pending auth on close, clears its timer and ignores late auth", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = setup();
+      let outcome = "pending";
+      const connecting = s.session.connect().then(
+        () => {
+          outcome = "fulfilled";
+        },
+        (error: Error) => {
+          outcome = error.message;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(1);
+      s.session.close();
+      s.session.close();
+      await vi.advanceTimersByTimeAsync(0);
+      expect.soft(outcome).toBe("RTC session closed");
+      expect.soft(vi.getTimerCount()).toBe(0);
+      s.sig.hub({ action: 1, code: 200 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect.soft(outcome).toBe("RTC session closed");
+      expect.soft(s.sig.sendCall).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(15_000);
+      await connecting;
+      expect(s.sig.close).toHaveBeenCalledTimes(1);
+      expect(s.peer.close).toHaveBeenCalledTimes(1);
+      expect(outcome).toBe("RTC session closed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("runs the whole exchange: grant → offer → answer → trickle → ack → open", async () => {
     const s = await authenticated(setup());
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });

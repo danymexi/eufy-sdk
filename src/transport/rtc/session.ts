@@ -61,7 +61,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
   private readonly logger: Logger;
   private turn?: TurnConfig;
   private authOk = false;
-  private authWaiter?: () => void;
+  private authWaiter?: (error?: Error) => void;
   private connected = false;
   private closed = false;
   private closeAnnounced = false;
@@ -120,6 +120,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     await this.signaling.fetchSign();
     await this.signaling.connect();
     await this.waitForAuth();
+    if (this.closed) throw new Error("RTC session closed");
     this.logger.debug(`[rtc] ${this.opts.stationSn} authenticated — scall`);
     this.signaling.sendCall();
   }
@@ -134,6 +135,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     if (this.closed) return;
     this.closed = true;
     this.connected = false;
+    this.authWaiter?.(new Error("RTC session closed"));
     try {
       if (this.signaling.isOpen) this.signaling.sendHangup();
     } catch {
@@ -151,21 +153,22 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
   }
 
   private waitForAuth(): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("RTC session closed"));
     if (this.authOk) return Promise.resolve();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.authWaiter = undefined;
-        reject(new Error("RTC signalling auth timeout"));
-      }, AUTH_TIMEOUT_MS);
-      this.authWaiter = () => {
+      const finish = (error?: Error) => {
         clearTimeout(timer);
         this.authWaiter = undefined;
-        resolve();
+        if (error) reject(error);
+        else resolve();
       };
+      const timer = setTimeout(() => finish(new Error("RTC signalling auth timeout")), AUTH_TIMEOUT_MS);
+      this.authWaiter = finish;
     });
   }
 
   private async onSignaling(inner: RtcInnerMessage): Promise<void> {
+    if (this.closed) return;
     if (inner.action === 1 && inner.code === 200) {
       this.authOk = true;
       this.authWaiter?.();
