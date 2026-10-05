@@ -102,6 +102,18 @@ describe("RtcLiveStream", () => {
     live.stop();
   });
 
+  it("drops a frame whose portal header declares more body than arrived", () => {
+    const { live, session } = stream();
+    const frames: LiveVideoFrame[] = [];
+    live.on("video", (f: LiveVideoFrame) => frames.push(f));
+    live.start();
+    const body = mediaBody(IDR);
+    const short = Buffer.concat([buildPortalHeader(1300, body.length + 1, 101, 0, 0), body]);
+    session.emit("mediaData", short);
+    expect(frames).toEqual([]);
+    live.stop();
+  });
+
   it("ends with an error on a refused start, and on a closed session", () => {
     const refused = stream();
     const errors: string[] = [];

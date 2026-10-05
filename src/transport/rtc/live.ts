@@ -192,6 +192,7 @@ export class RtcLiveStream extends EventEmitter implements LiveStreamHandle {
   private onMediaFrame(frame: Buffer): void {
     const h = parsePortalHeader(frame);
     if (!h || h.commandId !== LIVE_MEDIA || h.channel !== LIVE_MEDIA_CHANNEL) return;
+    if (h.paramLength > frame.length - PORTAL_HEADER_LENGTH) return;
     const media = parseMediaBody(frame.subarray(PORTAL_HEADER_LENGTH, PORTAL_HEADER_LENGTH + h.paramLength));
     if (!media) return;
     const { data, width, height } = media;
