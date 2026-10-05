@@ -212,7 +212,8 @@ export class RtcCommandRouter {
   private async buildLiveSource(route: RtcLiveRoute): Promise<SharedLiveSource> {
     const identity = this.deps.identity();
     if (!identity) throw new Error(`rtc: not logged in, cannot open ${route.stationSn}`);
-    const st = await this.stationSession(route.stationSn, route.adminUserId, identity);
+    const accountId = route.adminUserId || identity.userId;
+    const st = await this.stationSession(route.stationSn, accountId, identity);
     let leased = false;
     const release = () => {
       if (!leased) return;
@@ -231,7 +232,7 @@ export class RtcCommandRouter {
           seg: st.seg,
           stationSn: route.stationSn,
           channel: route.channel,
-          accountId: route.adminUserId,
+          accountId,
           logger: this.deps.logger,
         }),
       label: `${route.stationSn}#${route.channel}`,

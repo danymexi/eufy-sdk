@@ -7,10 +7,8 @@
  *    codec names `isResponse` carries the portal's `streamId`, `1` for a live view, and `chn_list` is an
  *    array of `{index, chn, sensor, isUps, isClicked}` objects. Stop is inner `cmd 1004`, the same way.
  *  - Video arrives on the live link as portal packets `1300` on channel `100 + play id`; a single-camera
- *    view is play id `1`, whatever the camera's own channel. Each body is a short hub prefix, then Annex
- *    B HEVC. A frame can open with a 16-byte hub unit behind a start code of its own, ahead of the video:
- *    a frame counter, then the picture size as u16 LE width and height, then 8 more bytes. See
- *    {@link splitFrameBody}.
+ *    view is play id `1`, whatever the camera's own channel. Each body is a fixed 22-byte media header,
+ *    then the Annex B video it declares. See {@link parseMediaBody}.
  *  - A raw, unframed keepalive (a 20-byte prefix and a bare `XZYH 1139`) goes out every ~29 s; the hub
  *    echoes it.
  *
@@ -49,26 +47,27 @@ const LIVE_STREAM_ID = 1;
 const KEEPALIVE_MS = 29_000;
 /** The portal's 36-byte data-channel keepalive: a 20-byte prefix and a bare `XZYH 1139`. */
 const KEEPALIVE = Buffer.from("0009000010000000000000006300000000000000585a5948730400000000000000000002", "hex");
-const ANNEX_B_START = Buffer.from([0, 0, 0, 1]);
 
-/** The length of the hub unit that can open a frame, after its start code. */
-const HUB_UNIT_LENGTH = 16;
+/** The media header ahead of the video in a `1300` body. */
+const MEDIA_HEADER_LENGTH = 22;
+/** The header's stream type for HEVC. */
+const STREAM_TYPE_HEVC = 1;
 
 /**
- * Split a `1300` body into the Annex B video and the picture size the hub states. The video starts at the
- * first start code; when the unit behind it is exactly {@link HUB_UNIT_LENGTH} bytes long (the next start
- * code follows it directly) it is the hub's own, carrying the size at bytes 4 to 7, and the video starts
- * after it.
+ * Read a `1300` body: a 22-byte media header (u32 LE video length at 0, stream type at 5, u16 LE width
+ * and height at 10 and 12), then the Annex B video. This is the layout the portal's own HEVC worker
+ * parses. Answers `undefined` for a short body, a stream that is not HEVC, or a declared length the body
+ * does not hold.
  */
-export function splitFrameBody(body: Buffer): { data: Buffer; width?: number; height?: number } {
-  const at = body.indexOf(ANNEX_B_START);
-  if (at < 0) return { data: body.subarray(body.length) };
-  const next = at + ANNEX_B_START.length + HUB_UNIT_LENGTH;
-  if (body.length < next + ANNEX_B_START.length || !body.subarray(next, next + 4).equals(ANNEX_B_START))
-    return { data: body.subarray(at) };
-  const width = body.readUInt16LE(at + 8);
-  const height = body.readUInt16LE(at + 10);
-  return { data: body.subarray(next), width, height };
+export function parseMediaBody(body: Buffer): { data: Buffer; width: number; height: number } | undefined {
+  if (body.length < MEDIA_HEADER_LENGTH || body[5] !== STREAM_TYPE_HEVC) return undefined;
+  const length = body.readUInt32LE(0);
+  if (body.length < MEDIA_HEADER_LENGTH + length) return undefined;
+  return {
+    data: body.subarray(MEDIA_HEADER_LENGTH, MEDIA_HEADER_LENGTH + length),
+    width: body.readUInt16LE(10),
+    height: body.readUInt16LE(12),
+  };
 }
 
 export interface RtcLiveOptions {
@@ -193,9 +192,9 @@ export class RtcLiveStream extends EventEmitter implements LiveStreamHandle {
   private onMediaFrame(frame: Buffer): void {
     const h = parsePortalHeader(frame);
     if (!h || h.commandId !== LIVE_MEDIA || h.channel !== LIVE_MEDIA_CHANNEL) return;
-    const { data, width, height } = splitFrameBody(
-      frame.subarray(PORTAL_HEADER_LENGTH, PORTAL_HEADER_LENGTH + h.paramLength),
-    );
+    const media = parseMediaBody(frame.subarray(PORTAL_HEADER_LENGTH, PORTAL_HEADER_LENGTH + h.paramLength));
+    if (!media) return;
+    const { data, width, height } = media;
     if (width && height) {
       this.width = width;
       this.height = height;

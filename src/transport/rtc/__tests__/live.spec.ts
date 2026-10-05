@@ -1,15 +1,23 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import type { LiveVideoFrame } from "../../../core/contracts.js";
-import { RtcLiveStream, splitFrameBody } from "../live.js";
+import { parseMediaBody, RtcLiveStream } from "../live.js";
 import { buildPortalHeader, parsePortalHeader, PORTAL_HEADER_LENGTH, SegmentCounter } from "../portal-packet.js";
 import type { RtcSession } from "../session.js";
 
 const START = Buffer.from([0, 0, 0, 1]);
-/** A 16-byte hub unit: frame counter, width 1920, height 1080, 8 more bytes. */
-const HUB_UNIT = Buffer.from("0200000080073804bfa81e02a1010000", "hex");
 const IDR = Buffer.concat([START, Buffer.from("2601af0e", "hex")]);
 const TRAIL = Buffer.concat([START, Buffer.from("0201d00a", "hex")]);
+
+/** A `1300` body: the 22-byte media header (length, stream type 1, 1920x1080), then `video`. */
+function mediaBody(video: Buffer, streamType = 1): Buffer {
+  const header = Buffer.alloc(22);
+  header.writeUInt32LE(video.length, 0);
+  header[5] = streamType;
+  header.writeUInt16LE(1920, 10);
+  header.writeUInt16LE(1080, 12);
+  return Buffer.concat([header, video]);
+}
 
 class FakeSession extends EventEmitter {
   sent: Buffer[] = [];
@@ -40,14 +48,22 @@ function stream(session = new FakeSession()) {
 const media = (body: Buffer, channel = 101) =>
   Buffer.concat([buildPortalHeader(1300, body.length, channel, 0, 0), body]);
 
-describe("splitFrameBody", () => {
-  it("drops the hub unit that opens a frame and reads the picture size from it", () => {
-    const body = Buffer.concat([Buffer.from("aabb", "hex"), START, HUB_UNIT, IDR]);
-    expect(splitFrameBody(body)).toEqual({ data: IDR, width: 1920, height: 1080 });
+describe("parseMediaBody", () => {
+  it("takes the declared video after the 22-byte header and the size from it", () => {
+    expect(parseMediaBody(mediaBody(IDR))).toEqual({ data: IDR, width: 1920, height: 1080 });
   });
 
-  it("keeps a frame that opens with video as it is", () => {
-    expect(splitFrameBody(Buffer.concat([Buffer.from("aabb", "hex"), TRAIL]))).toEqual({ data: TRAIL });
+  it("keeps a header whose length bytes read like a start code out of the video", () => {
+    // A short frame's length (high bytes 0) and stream type 1 spell 00 00 00 01 at offsets 2-5.
+    const body = mediaBody(TRAIL);
+    expect(body.subarray(2, 6).toString("hex")).toBe("00000001");
+    expect(parseMediaBody(body)?.data).toEqual(TRAIL);
+  });
+
+  it("refuses a short body, another stream type, and a length the body does not hold", () => {
+    expect(parseMediaBody(Buffer.alloc(10))).toBeUndefined();
+    expect(parseMediaBody(mediaBody(IDR, 2))).toBeUndefined();
+    expect(parseMediaBody(mediaBody(IDR).subarray(0, 24))).toBeUndefined();
   });
 });
 
@@ -76,9 +92,9 @@ describe("RtcLiveStream", () => {
     const frames: LiveVideoFrame[] = [];
     live.on("video", (f: LiveVideoFrame) => frames.push(f));
     live.start();
-    session.emit("mediaData", media(Buffer.concat([Buffer.from("aabb", "hex"), START, HUB_UNIT, IDR])));
-    session.emit("mediaData", media(Buffer.concat([Buffer.from("aabb", "hex"), TRAIL])));
-    session.emit("mediaData", media(TRAIL, 102));
+    session.emit("mediaData", media(mediaBody(IDR)));
+    session.emit("mediaData", media(mediaBody(TRAIL)));
+    session.emit("mediaData", media(mediaBody(TRAIL), 102));
     expect(frames.map((f) => [f.codec, f.keyframe, f.width, f.height, f.data.toString("hex")])).toEqual([
       ["h265", true, 1920, 1080, IDR.toString("hex")],
       ["h265", false, 1920, 1080, TRAIL.toString("hex")],
