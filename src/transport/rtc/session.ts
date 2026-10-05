@@ -61,7 +61,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
   private readonly logger: Logger;
   private turn?: TurnConfig;
   private authOk = false;
-  private authWaiter?: () => void;
+  private authWaiter?: { resolve: () => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
   private connected = false;
   private closed = false;
   private closeAnnounced = false;
@@ -129,7 +129,10 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     return this.peer.sendCommand(portalPacket);
   }
 
-  /** Hang up and tear both sides down; `close` fires once, here if nothing announced it before. */
+  /**
+   * Hang up and tear both sides down; `close` fires once, here if nothing announced it before. A
+   * `connect()` still waiting for the signalling auth is rejected and its timer stopped.
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -141,6 +144,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     }
     this.signaling.close();
     this.peer.close();
+    this.settleAuth(new Error("RTC session closed while waiting for signalling auth"));
     this.announceClose();
   }
 
@@ -157,18 +161,24 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
         this.authWaiter = undefined;
         reject(new Error("RTC signalling auth timeout"));
       }, AUTH_TIMEOUT_MS);
-      this.authWaiter = () => {
-        clearTimeout(timer);
-        this.authWaiter = undefined;
-        resolve();
-      };
+      this.authWaiter = { resolve, reject, timer };
     });
+  }
+
+  /** Settle a pending auth wait: resolve it, or reject it with `err`; either way its timer stops. */
+  private settleAuth(err?: Error): void {
+    const waiter = this.authWaiter;
+    if (!waiter) return;
+    this.authWaiter = undefined;
+    clearTimeout(waiter.timer);
+    if (err) waiter.reject(err);
+    else waiter.resolve();
   }
 
   private async onSignaling(inner: RtcInnerMessage): Promise<void> {
     if (inner.action === 1 && inner.code === 200) {
       this.authOk = true;
-      this.authWaiter?.();
+      this.settleAuth();
     }
     if (!inner.data) return;
     let payload: Record<string, unknown>;
