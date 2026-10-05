@@ -1165,7 +1165,7 @@ export class EufyMega extends EventEmitter {
     const deviceType = typeof raw.device_type === "number" ? raw.device_type : undefined;
     if (!target || !station || !isStation9000({ deviceType, model: station.model })) return undefined;
     const member = raw.member?.admin_user_id;
-    const adminUserId = (typeof member === "string" && member) || this.mega.rtcIdentity()?.userId || "";
+    const adminUserId = typeof member === "string" && member ? member : undefined;
     return { stationSn, adminUserId, attached: stationSn !== sn };
   }
 

@@ -154,6 +154,13 @@ describe("RtcCommandRouter", () => {
     });
   });
 
+  it("names the logged-in user when the route carries no admin id", async () => {
+    const { router, sessions } = makeRouter();
+    await router.dispatchCommand({ stationSn: SN, attached: false }, arming(1));
+    expect(sessions[0]!.opts.adminUserId).toBe("uid");
+    expect(sent(sessions[0]!.sent[0]!).body.account_id).toBe("uid");
+  });
+
   it("reuses the station session across commands and serialises them", async () => {
     const { router, sessions } = makeRouter();
     await Promise.all([router.dispatchCommand(ST, arming(1)), router.dispatchCommand(ST, arming(2))]);
