@@ -96,6 +96,21 @@ describe("RtcSession", () => {
     }
   });
 
+  it("rejects a connect() still waiting for auth when the session is closed", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = setup();
+      const connecting = s.session.connect();
+      const settled = expect(connecting).rejects.toThrow(/closed while waiting for signalling auth/);
+      await vi.waitFor(() => expect(s.sig.connect).toHaveBeenCalled());
+      s.session.close();
+      await settled;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("runs the whole exchange: grant → offer → answer → trickle → ack → open", async () => {
     const s = await authenticated(setup());
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });
