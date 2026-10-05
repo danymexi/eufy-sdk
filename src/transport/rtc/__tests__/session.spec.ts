@@ -112,6 +112,16 @@ describe("RtcSession", () => {
     }
   });
 
+  it("places no call when the session is closed between the auth and connect() resuming", async () => {
+    const s = setup();
+    const connecting = s.session.connect();
+    await vi.waitFor(() => expect(s.sig.connect).toHaveBeenCalled());
+    s.sig.hub({ action: 1, code: 200 });
+    queueMicrotask(() => s.session.close());
+    await expect(connecting).rejects.toThrow(/closed before the call was placed/);
+    expect(s.sig.sendCall).not.toHaveBeenCalled();
+  });
+
   it("runs the whole exchange: grant → offer → answer → trickle → ack → open", async () => {
     const s = await authenticated(setup());
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });
