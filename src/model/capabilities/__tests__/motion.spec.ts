@@ -276,7 +276,7 @@ describe("motion — sensor test mode", () => {
 
   it("enters with the channel inside the payload, which is what the device requires", async () => {
     const { actions, sent } = bind("sensor");
-    await actions.setTestMode(true);
+    await actions.setTestMode!(true);
     expect(sent[0]).toMatchObject({
       kind: "set-payload",
       cmd: MOTION_CMD.SENSOR_ENTER_TEST_MODE,
@@ -286,7 +286,7 @@ describe("motion — sensor test mode", () => {
 
   it("leaves through the direct-binary shape, not the payload one", async () => {
     const { actions, sent } = bind("sensor");
-    await actions.setTestMode(false);
+    await actions.setTestMode!(false);
     expect(sent[0]).toMatchObject({
       kind: "set-param",
       param: MOTION_CMD.SENSOR_EXIT_TEST_MODE,
@@ -294,15 +294,9 @@ describe("motion — sensor test mode", () => {
     });
   });
 
-  /**
-   * A REJECTION, not a synchronous throw: `requireFamily` throws while building the command, and
-   * `bindMembers` converts that so every derived setter keeps one Promise contract — a caller chaining
-   * `.catch()` would miss a sync throw entirely.
-   */
-  it("refuses both on a camera — the pair exists only on sensors", async () => {
+  it("withholds the setter on a camera — the pair exists only on sensors", () => {
     const { actions } = bind("camera");
-    await expect(actions.setTestMode(true)).rejects.toThrow(/verified only on a sensor/);
-    await expect(actions.setTestMode(false)).rejects.toThrow(/verified only on a sensor/);
+    expect(actions.setTestMode).toBeUndefined();
   });
 });
 
