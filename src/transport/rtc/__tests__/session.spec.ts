@@ -133,6 +133,35 @@ describe("RtcSession", () => {
     expect(s.sig.connect).not.toHaveBeenCalled();
   });
 
+  it("reports the bring-up step it is waiting on", async () => {
+    const s = setup();
+    expect(s.session.stage).toBe("sign");
+    const connecting = s.session.connect();
+    await vi.waitFor(() => expect(s.sig.connect).toHaveBeenCalled());
+    expect(s.session.stage).toBe("signalling auth");
+    s.sig.hub({ action: 1, code: 200 });
+    await connecting;
+    expect(s.session.stage).toBe("relay grant");
+    s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });
+    await flush();
+    expect(s.session.stage).toBe("hub offer");
+    s.sig.hub({ action: 3, dataType: "info", data: { sdp: JSON.stringify(HUB_SDP) } });
+    await flush();
+    expect(s.session.stage).toBe("ice (peer new)");
+    s.peer.emit("connectionState", "connecting");
+    expect(s.session.stage).toBe("ice (peer connecting)");
+    s.peer.emit("commandChannelOpen");
+    expect(s.session.stage).toBe("open");
+  });
+
+  it("drops a local candidate the peer reports after the signalling socket closed", async () => {
+    const s = await authenticated(setup());
+    s.sig.isOpen = false;
+    s.peer.emit("iceCandidate", "our-host");
+    s.peer.emit("iceGatheringComplete");
+    expect(s.sig.sendInfoCandidate).not.toHaveBeenCalled();
+  });
+
   it("runs the whole exchange: grant → offer → answer → trickle → ack → open", async () => {
     const s = await authenticated(setup());
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });

@@ -410,7 +410,7 @@ export class RtcCommandRouter {
       const onConnected = () => finish();
       const onClose = () => finish(new Error(`rtc: ${sn} session closed before the command channel opened`));
       const timer = setTimeout(
-        () => finish(new Error(`rtc: ${sn} did not come up within ${CONNECT_TIMEOUT_MS}ms`)),
+        () => finish(new Error(`rtc: ${sn} did not come up within ${CONNECT_TIMEOUT_MS}ms, at ${session.stage}`)),
         CONNECT_TIMEOUT_MS,
       );
       session.once("connected", onConnected);

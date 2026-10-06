@@ -46,6 +46,12 @@ export interface RtcSessionEvents {
   mediaData: [frame: Buffer];
 }
 
+/**
+ * How far a session's bring-up has got: the step it is waiting on. `ice` waits for the relay pair and
+ * DTLS, with the native peer's last reported state beside it; `open` means the command channel opened.
+ */
+type RtcSessionStage = "sign" | "signalling socket" | "signalling auth" | "relay grant" | "hub offer" | "ice" | "open";
+
 interface CallPayload {
   status?: number;
   turn?: TurnConfig;
@@ -69,6 +75,8 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
   private closed = false;
   private closeAnnounced = false;
   private sdpHandled = false;
+  private stage_: RtcSessionStage = "sign";
+  private peerState = "new";
   private chain: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: RtcSessionOptions) {
@@ -90,11 +98,12 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     });
     this.signaling.on("error", (e) => this.emit("error", e));
 
-    this.peer.on("iceCandidate", (c) => this.signaling.sendInfoCandidate(toWireCandidate(c)));
-    this.peer.on("iceGatheringComplete", () => this.signaling.sendInfoCandidate(""));
+    this.peer.on("iceCandidate", (c) => this.trickle(toWireCandidate(c)));
+    this.peer.on("iceGatheringComplete", () => this.trickle(""));
     this.peer.on("commandChannelOpen", () => {
       if (this.connected) return;
       this.connected = true;
+      this.stage_ = "open";
       this.logger.debug(`[rtc] ${this.opts.stationSn} command channel open`);
       this.emit("connected");
     });
@@ -105,6 +114,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       this.announceClose();
     });
     this.peer.on("connectionState", (state) => {
+      this.peerState = state;
       if ((state === "failed" || state === "closed") && this.connected) {
         this.connected = false;
         this.announceClose();
@@ -121,6 +131,11 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     return this.connected;
   }
 
+  /** The bring-up step the session is on, with the native peer's state while ICE is in progress. */
+  get stage(): string {
+    return this.stage_ === "ice" ? `ice (peer ${this.peerState})` : this.stage_;
+  }
+
   /**
    * Start the sequence; resolves once `scall` is sent. `connected` fires when the channel opens. A session
    * closed by the time the sign fetch or the auth completes rejects instead of opening the socket or
@@ -129,10 +144,13 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
   async connect(): Promise<void> {
     await this.signaling.fetchSign();
     if (this.closed) throw new Error("RTC session closed before the call was placed");
+    this.stage_ = "signalling socket";
     await this.signaling.connect();
+    this.stage_ = "signalling auth";
     await this.waitForAuth();
     if (this.closed) throw new Error("RTC session closed before the call was placed");
     this.logger.debug(`[rtc] ${this.opts.stationSn} authenticated — scall`);
+    this.stage_ = "relay grant";
     this.signaling.sendCall();
   }
 
@@ -163,6 +181,15 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     this.peer.close();
     this.settleAuth(new Error("RTC session closed while waiting for signalling auth"));
     this.announceClose();
+  }
+
+  /**
+   * Trickle one local candidate, or the empty end-of-candidates. The native peer reports candidates from
+   * its own thread, after the signalling socket may have closed; with no socket there is nobody to tell.
+   */
+  private trickle(candidate: string): void {
+    if (this.closed || !this.signaling.isOpen) return;
+    this.signaling.sendInfoCandidate(candidate);
   }
 
   private announceClose(): void {
@@ -226,6 +253,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     const status = payload.status;
     if (status === 100 && payload.turn) {
       this.turn = payload.turn;
+      this.stage_ = "hub offer";
       await this.peer.init(payload.turn);
       return;
     }
@@ -269,6 +297,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       offer = sdpText;
     }
     const answer = await this.peer.handleRemoteOffer(offer);
+    this.stage_ = "ice";
     this.signaling.sendInfoSdp(JSON.stringify(sdpToScallJson(answer)));
     this.logger.debug(`[rtc] ${this.opts.stationSn} answered the hub's offer`);
   }

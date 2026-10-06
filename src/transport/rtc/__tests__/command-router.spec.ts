@@ -30,6 +30,7 @@ async function rejectsAfter(promise: Promise<unknown>, pattern: RegExp | string,
 class FakeSession extends EventEmitter {
   connected = false;
   closed = false;
+  stage = "signalling auth";
   sent: Buffer[] = [];
   /** What to do with a sent packet: "ack" (default), "nack" (errCode 1), "silent", or "close". */
   behaviour: "ack" | "nack" | "silent" | "close" = "ack";
@@ -346,7 +347,7 @@ describe("RtcCommandRouter", () => {
       expect(sessions[0]!.closed).toBe(true);
       FakeSession.connectMode = "never";
       const { router: r2, sessions: s2 } = makeRouter();
-      const late = new RegExp(`did not come up within ${CONNECT_TIMEOUT_MS}ms`);
+      const late = new RegExp(`did not come up within ${CONNECT_TIMEOUT_MS}ms, at signalling auth`);
       await onFakeTimers(() => rejectsAfter(r2.dispatchCommand(ST, arming(1)), late, CONNECT_TIMEOUT_MS));
       expect(s2[0]!.closed).toBe(true);
       // connect() that never settles at all: the bounded bring-up's deadline still fires and closes it
