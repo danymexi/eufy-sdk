@@ -353,9 +353,11 @@ export const LOCK: CapabilityModule = {
   description: "Smart-lock locked/unlocked state and battery.",
   members: LOCK_MEMBERS,
   properties: propertiesOf(LOCK_MEMBERS),
-  // Lock state is reported via param 6000 (verified: 4=locked, 3=unlocked); the model name (lock/safe) is a
-  // signal, and every lock-codec device has the lock capability as its baseline.
-  detection: { evidenceParams: [6000], modelHints: [/lock/i, /safe/i], codecs: ["lock"] },
+  detection: {
+    evidenceParams: [6000],
+    codecs: ["lock"],
+    detect: (rec) => /lock|safe/i.test([rec.model, rec.category].filter(Boolean).join(" ")),
+  },
   // Inbound FCM lock events (LockPushEvent 257..771: (un)lock actions + alarms) → one "lockState", whose
   // payload carries a decoded `locked` boolean for the (un)lock actions (see decodeLockTransition).
   events: [{ source: "push", match: [257, 771], emit: "lockState", derive: decodeLockTransition }],
