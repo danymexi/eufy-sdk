@@ -123,10 +123,12 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
 
   /**
    * Start the sequence; resolves once `scall` is sent. `connected` fires when the channel opens. A session
-   * closed by the time the auth completes rejects instead of placing the call.
+   * closed by the time the sign fetch or the auth completes rejects instead of opening the socket or
+   * placing the call.
    */
   async connect(): Promise<void> {
     await this.signaling.fetchSign();
+    if (this.closed) throw new Error("RTC session closed before the call was placed");
     await this.signaling.connect();
     await this.waitForAuth();
     if (this.closed) throw new Error("RTC session closed before the call was placed");
