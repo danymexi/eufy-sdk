@@ -121,6 +121,17 @@ describe("RtcSession", () => {
     expect(s.sig.sendCall).not.toHaveBeenCalled();
   });
 
+  it("opens no socket when the session is closed while the sign fetch is pending", async () => {
+    const s = setup();
+    let releaseSign!: (sign: string) => void;
+    s.sig.fetchSign.mockImplementationOnce(() => new Promise<string>((resolve) => (releaseSign = resolve)));
+    const connecting = s.session.connect();
+    s.session.close();
+    releaseSign("SIGN");
+    await expect(connecting).rejects.toThrow(/closed before the call was placed/);
+    expect(s.sig.connect).not.toHaveBeenCalled();
+  });
+
   it("runs the whole exchange: grant → offer → answer → trickle → ack → open", async () => {
     const s = await authenticated(setup());
     s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });
