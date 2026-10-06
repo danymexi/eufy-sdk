@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import type { RtcPeer, TurnConfig } from "../peer.js";
 import { scallJsonToSdp, sdpToScallJson } from "../scall-sdp.js";
-import { RtcSession } from "../session.js";
+import { RtcSession, type RtcSessionOptions } from "../session.js";
 import type { RtcInnerMessage, RtcSignalingClient } from "../signaling.js";
 
 class FakeSignaling extends EventEmitter {
@@ -43,7 +43,7 @@ const HUB_SDP = {
   candidate: ["1 1 udp 1 192.0.2.10 1 typ host"],
 };
 
-function setup() {
+function setup(over: Partial<RtcSessionOptions> = {}) {
   const sig = new FakeSignaling();
   const peer = new FakePeer();
   const session = new RtcSession({
@@ -55,6 +55,7 @@ function setup() {
     country: "IT",
     createSignaling: () => sig as unknown as RtcSignalingClient,
     createPeer: () => peer as unknown as RtcPeer,
+    ...over,
   });
   const errors: Error[] = [];
   session.on("error", (e) => errors.push(e));
@@ -152,6 +153,24 @@ describe("RtcSession", () => {
     expect(s.session.stage).toBe("ice (peer connecting)");
     s.peer.emit("commandChannelOpen");
     expect(s.session.stage).toBe("open");
+  });
+
+  it("times each bring-up step, the hub's offer apart from the native peer's init", async () => {
+    let t = 1_000;
+    const s = setup({ now: () => t });
+    const connecting = s.session.connect();
+    await vi.waitFor(() => expect(s.sig.connect).toHaveBeenCalled());
+    t += 1_500;
+    s.sig.hub({ action: 1, code: 200 });
+    await connecting;
+    t += 500;
+    s.sig.hub({ action: 3, dataType: "scall", data: { status: 100, turn: TURN } });
+    await flush();
+    t += 10_000;
+    expect(s.session.stage).toBe("hub offer");
+    expect(s.session.stageTimings).toBe(
+      "sign 0.0s, signalling socket 0.0s, signalling auth 1.5s, relay grant 0.5s, peer init 0.0s, hub offer 10.0s",
+    );
   });
 
   it("drops a local candidate the peer reports after the signalling socket closed", async () => {

@@ -50,7 +50,8 @@ export interface RtcSessionEvents {
  * How far a session's bring-up has got: the step it is waiting on. `ice` waits for the relay pair and
  * DTLS, with the native peer's last reported state beside it; `open` means the command channel opened.
  */
-type RtcSessionStage = "sign" | "signalling socket" | "signalling auth" | "relay grant" | "hub offer" | "ice" | "open";
+type RtcSessionStage =
+  "sign" | "signalling socket" | "signalling auth" | "relay grant" | "peer init" | "hub offer" | "ice" | "open";
 
 interface CallPayload {
   status?: number;
@@ -76,12 +77,15 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
   private closeAnnounced = false;
   private sdpHandled = false;
   private stage_: RtcSessionStage = "sign";
+  /** When each bring-up step was entered, in order. */
+  private readonly steps: Array<{ stage: RtcSessionStage; at: number }>;
   private peerState = "new";
   private chain: Promise<void> = Promise.resolve();
 
   constructor(private readonly opts: RtcSessionOptions) {
     super();
     this.logger = opts.logger ?? noopLogger;
+    this.steps = [{ stage: "sign", at: this.now() }];
     this.signaling = (opts.createSignaling ?? ((o) => new RtcSignalingClient(o)))(opts);
     this.peer = (opts.createPeer ?? ((o) => new RtcPeer(o)))({ logger: this.logger, ...opts.peer });
 
@@ -103,7 +107,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     this.peer.on("commandChannelOpen", () => {
       if (this.connected) return;
       this.connected = true;
-      this.stage_ = "open";
+      this.enter("open");
       this.logger.debug(`[rtc] ${this.opts.stationSn} command channel open`);
       this.emit("connected");
     });
@@ -136,6 +140,23 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     return this.stage_ === "ice" ? `ice (peer ${this.peerState})` : this.stage_;
   }
 
+  /** How long each bring-up step took, in order; the last one is still running and counts up to now. */
+  get stageTimings(): string {
+    const end = this.now();
+    return this.steps
+      .map((s, i) => `${s.stage} ${(((this.steps[i + 1]?.at ?? end) - s.at) / 1000).toFixed(1)}s`)
+      .join(", ");
+  }
+
+  private now(): number {
+    return (this.opts.now ?? Date.now)();
+  }
+
+  private enter(stage: RtcSessionStage): void {
+    this.stage_ = stage;
+    this.steps.push({ stage, at: this.now() });
+  }
+
   /**
    * Start the sequence; resolves once `scall` is sent. `connected` fires when the channel opens. A session
    * closed by the time the sign fetch or the auth completes rejects instead of opening the socket or
@@ -144,13 +165,13 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
   async connect(): Promise<void> {
     await this.signaling.fetchSign();
     if (this.closed) throw new Error("RTC session closed before the call was placed");
-    this.stage_ = "signalling socket";
+    this.enter("signalling socket");
     await this.signaling.connect();
-    this.stage_ = "signalling auth";
+    this.enter("signalling auth");
     await this.waitForAuth();
     if (this.closed) throw new Error("RTC session closed before the call was placed");
     this.logger.debug(`[rtc] ${this.opts.stationSn} authenticated — scall`);
-    this.stage_ = "relay grant";
+    this.enter("relay grant");
     this.signaling.sendCall();
   }
 
@@ -253,8 +274,9 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
     const status = payload.status;
     if (status === 100 && payload.turn) {
       this.turn = payload.turn;
-      this.stage_ = "hub offer";
+      this.enter("peer init");
       await this.peer.init(payload.turn);
+      this.enter("hub offer");
       return;
     }
     if (status === 200) {
@@ -297,7 +319,7 @@ export class RtcSession extends EventEmitter<RtcSessionEvents> {
       offer = sdpText;
     }
     const answer = await this.peer.handleRemoteOffer(offer);
-    this.stage_ = "ice";
+    this.enter("ice");
     this.signaling.sendInfoSdp(JSON.stringify(sdpToScallJson(answer)));
     this.logger.debug(`[rtc] ${this.opts.stationSn} answered the hub's offer`);
   }
