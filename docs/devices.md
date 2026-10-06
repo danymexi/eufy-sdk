@@ -137,6 +137,34 @@ _(A low-level `getProperty(name)` / `getProperties()` escape hatch exists for un
 diagnostics, or a param not yet surfaced on a capability — but reach for the typed capability getters
 above in application code.)_
 
+### Explicit HDD telemetry
+
+HomeBase S1/T9000 on firmware 4.4.0.4 exposes an optional HDD read. It is an explicit request, not a
+passive getter: binding the device does not read storage, and the SDK does not schedule polling.
+
+```ts
+const hdd = await dev.storage?.()?.getHddTelemetry?.();
+if (hdd) {
+  console.log(`${(hdd.usedBytes / 1e12).toFixed(2)} TB / ${(hdd.totalBytes / 1e12).toFixed(2)} TB used`);
+  console.log(`${hdd.usedPercent.toFixed(1)}%`, new Date(hdd.observedAtMs));
+}
+```
+
+The read shares the station's normal connection owner, acquiring a session only when explicitly
+called. Acquisition and the exchange have a combined 15-second deadline and no retry. A busy session,
+cancellation, changed ownership or transport failure rejects the read; cancelling a read does not
+cancel a shared connection bring-up. Sessions retain their normal idle lifetime.
+
+Incomplete or inconsistent HDD reports answer `undefined`. Capacities use the qualified usable-total
+and video-plus-system usage interpretation, converted to bytes; `availableBytes` and `usedPercent`
+are derived. Decimal TB/GB use divisors of `1e12`/`1e9`; binary TiB/GiB use `2 ** 40`/`2 ** 30`.
+The scale is qualified for this model and firmware, not a claim of universal byte precision.
+
+`observedAtMs` is local arrival time of the notification. Its `correlation` remains `time-associated`
+and `exactlyCorrelated` is `false`: the protocol does not prove the report uniquely answers this
+request or that its contents were freshly measured. Unsupported models or firmware have no read
+method. eMMC capacities, storage-health labels and battery health/runtime are not inferred here.
+
 ## When a setting means something different per device
 
 A few settings are not one scale. Motion sensitivity is the clearest: across the device families this

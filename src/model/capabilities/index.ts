@@ -85,6 +85,7 @@ import { LOCK } from "./lock.js";
 import { KEYPAD } from "./keypad.js";
 import { ARMING } from "./arming.js";
 import { STORAGE } from "./storage.js";
+export type { HddTelemetry, StorageActions } from "./storage.js";
 import { VACUUM_CLEAN } from "./vacuum-clean.js";
 import { VACUUM_DOCK } from "./vacuum-dock.js";
 import { SUCTION } from "./suction.js";
@@ -118,6 +119,7 @@ import type { DisplayActions } from "./display.js";
 import type { SuctionActions } from "./suction.js";
 import type { LocateActions } from "./locate.js";
 import type { DeviceInfo } from "./info.js";
+import type { StorageActions } from "./storage.js";
 
 /** Every capability module, in a stable order (governs `mergeProperties`/`buildCommand` precedence). */
 const MODULES: CapabilityModule[] = [
@@ -810,6 +812,8 @@ export interface DeviceActionMap {
   display: DisplayActions;
   /** Identity metadata (read-only): `{ manufacturer, model, serialNumber, name, deviceType?, firmwareVersion?, hardwareVersion? }`. */
   info: DeviceInfo;
+  /** Qualified HDD quantities from an explicit read on a supported station. */
+  storage: StorageActions;
 }
 
 /**

@@ -58,6 +58,7 @@ import {
   type CommandSink,
   type Ff09SettingsReader,
   type MediaProvider,
+  type PortalPayloadReader,
   type TuyaDpInbound,
 } from "../core/contracts.js";
 import { noopLogger } from "../core/logger.js";
@@ -634,6 +635,7 @@ export class EufyMega extends EventEmitter {
         this.mediaProviderFor(sn),
         this.ff09SettingsReaderFor(sn, ctx),
         rawDpCodec,
+        this.portalPayloadReaderFor(sn, ctx),
       );
       this.boundParamIds.set(sn, new Set([...(this.boundParamIds.get(sn) ?? []), ...ctx.paramIds]));
       this.emit("deviceState", this.deviceState(sn));
@@ -1275,6 +1277,7 @@ export class EufyMega extends EventEmitter {
       this.mediaProviderFor(sn),
       this.ff09SettingsReaderFor(sn, ctx),
       rawDpCodec,
+      this.portalPayloadReaderFor(sn, ctx),
     );
     this.boundParamIds.set(sn, ctx.paramIds);
     if (this.opts.autoRealtime !== false) {
@@ -1309,6 +1312,49 @@ export class EufyMega extends EventEmitter {
         ctx.hasP2p
           ? this.p2p.getAutoLockState(sn, { adminUserId, deviceSn })
           : this.mqtt.getAutoLockState(sn, { adminUserId, deviceSn }),
+    };
+  }
+
+  /** Inject the optional portal frame reader without acquiring a session or fetching a record. */
+  private portalPayloadReaderFor(sn: string, ctx: CommandContext): PortalPayloadReader | undefined {
+    const qualifies = (dev: EufyDevice | undefined): dev is EufyDevice => {
+      if (!dev || dev.model !== "T9000" || (dev.stationSn && dev.stationSn !== sn)) return false;
+      const raw = (dev.raw ?? {}) as Record<string, unknown>;
+      const deviceType = typeof raw.device_type === "number" ? raw.device_type : undefined;
+      return isStation9000({ deviceType, model: dev.model });
+    };
+    const find = () => this.registry.list().find((entry) => entry.sn === sn);
+    if (!qualifies(find())) return undefined;
+    const adminFor = (dev: EufyDevice) => {
+      const raw = dev.raw as { member?: { admin_user_id?: unknown } } | undefined;
+      const admin = raw?.member?.admin_user_id;
+      return (typeof admin === "string" && admin) || this.mega.rtcIdentity()?.userId;
+    };
+    return {
+      readPayload: (intent, signal) => {
+        const current = find();
+        if (
+          !qualifies(current) ||
+          current.model !== ctx.model ||
+          recordString((current.raw ?? {}) as Record<string, unknown>, "main_sw_version") !== ctx.firmwareVersion
+        )
+          return Promise.reject(new Error("rtc: payload reader device record changed"));
+        const stationSn = current.stationSn;
+        const adminUserId = adminFor(current);
+        if (!adminUserId) return Promise.reject(new Error("rtc: payload read requires a known logged-in station"));
+        const isRecordCurrent = () => {
+          const latest = find();
+          return (
+            latest === current &&
+            latest.stationSn === stationSn &&
+            qualifies(latest) &&
+            latest.model === ctx.model &&
+            recordString((latest.raw ?? {}) as Record<string, unknown>, "main_sw_version") === ctx.firmwareVersion &&
+            adminFor(latest) === adminUserId
+          );
+        };
+        return this.rtc.readPayload({ stationSn: sn, adminUserId }, intent, isRecordCurrent, signal);
+      },
     };
   }
 
@@ -1621,6 +1667,7 @@ export class EufyMega extends EventEmitter {
         this.mediaProviderFor(sn),
         this.ff09SettingsReaderFor(sn, ctx),
         rawDpCodec,
+        this.portalPayloadReaderFor(sn, ctx),
       );
       this.boundParamIds.set(sn, ctx.paramIds);
       this.emit("deviceCapabilities", { deviceSn: sn, gained, capabilities: [...dev.capabilities] });
