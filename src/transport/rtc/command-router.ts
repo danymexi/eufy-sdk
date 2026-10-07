@@ -25,6 +25,7 @@ import {
   type LiveStreamConsumer,
   type LiveVideoFrame,
   type MediaProvider,
+  type SharedSourceHints,
 } from "../../core/contracts.js";
 import type { Logger } from "../../core/logger.js";
 import { abortable } from "../abortable.js";
@@ -101,6 +102,10 @@ export interface RtcCommandRouterDeps {
 interface StationLive {
   cameraSn: string;
   source: Promise<SharedLiveSource>;
+  /** The source once built; a pending build has none. */
+  built?: SharedLiveSource;
+  /** Callers awaiting the build, which have not attached or given up yet. */
+  waiters: number;
 }
 
 interface StationSession {
@@ -159,28 +164,29 @@ export class RtcCommandRouter {
    * session. Recording has no wire here and is refused; the optional members it has no wire for are absent.
    */
   mediaProviderFor(route: RtcLiveRoute): MediaProvider {
-    const attach = async (signal?: AbortSignal): Promise<LiveStreamConsumer> => {
-      const source = await abortable(this.liveSource(route), signal);
-      const consumer = source.attach();
-      if (signal?.aborted) {
-        consumer.detach();
-        signal.throwIfAborted();
+    const attach = async (
+      hints: SharedSourceHints = {},
+      signal?: AbortSignal,
+    ): Promise<ReturnType<SharedLiveSource["attach"]>> => {
+      signal?.throwIfAborted();
+      const entry = this.liveEntry(route, hints);
+      entry.waiters++;
+      let source: SharedLiveSource;
+      try {
+        source = await abortable(entry.source, signal);
+      } catch (e) {
+        entry.waiters--;
+        if (signal?.aborted) this.reapWhenBuilt(route.stationSn, entry);
+        throw e;
       }
-      return consumer;
+      entry.waiters--;
+      return source.attach();
     };
     return {
-      live: (opts) => attach(opts?.signal),
-      openReadable: async (opts) => {
-        const source = await abortable(this.liveSource(route), opts?.signal);
-        const consumer = source.attach();
-        if (opts?.signal?.aborted) {
-          consumer.detach();
-          opts.signal.throwIfAborted();
-        }
-        return openReadableFromConsumer(consumer, opts);
-      },
+      live: (opts) => attach(opts, opts?.signal),
+      openReadable: async (opts) => openReadableFromConsumer(await attach(opts, opts?.signal), opts),
       snapshotLive: async (opts) => {
-        const consumer = await attach().catch((e: unknown) => {
+        const consumer = await attach(opts).catch((e: unknown) => {
           if (!(e instanceof StationStreamBusyError)) throw e;
           throw new LiveSnapshotUnavailableError("source-failed", e.message, { cause: e });
         });
@@ -193,36 +199,61 @@ export class RtcCommandRouter {
   }
 
   /**
-   * Tear down every station session (logout / shutdown). Live sources are disposed first, so their
-   * consumers are ended while the session can still carry the stop.
+   * Tear down every station session (logout / shutdown). A built live source is disposed before its session
+   * closes, so its consumers end cleanly and its stop still rides the session; a build still pending is
+   * disposed when it lands.
    */
   close(): void {
     for (const [sn, live] of this.lives) {
       this.lives.delete(sn);
-      void live.source.then((source) => source.dispose()).catch(() => undefined);
+      if (live.built) live.built.dispose();
+      else void live.source.then((source) => source.dispose()).catch(() => undefined);
     }
     for (const [sn, st] of this.sessions) this.drop(sn, st);
   }
 
   /**
-   * The station's live source for this camera. The entry is registered before the session is awaited, so
-   * concurrent callers share one build; a different camera on the same station is refused while it lives.
+   * The station's live entry for this camera. It is registered before the session is awaited, so concurrent
+   * callers share one build, and the first caller's {@link SharedSourceHints} configure it. A different
+   * camera on the same station is refused while it lives.
    */
-  private liveSource(route: RtcLiveRoute): Promise<SharedLiveSource> {
+  private liveEntry(route: RtcLiveRoute, hints: SharedSourceHints): StationLive {
     const current = this.lives.get(route.stationSn);
     if (current) {
-      if (current.cameraSn === route.cameraSn) return current.source;
-      return Promise.reject(new StationStreamBusyError(route.stationSn, current.cameraSn));
+      if (current.cameraSn === route.cameraSn) return current;
+      throw new StationStreamBusyError(route.stationSn, current.cameraSn);
     }
-    const entry: StationLive = { cameraSn: route.cameraSn, source: this.buildLiveSource(route) };
+    const entry: StationLive = { cameraSn: route.cameraSn, source: this.buildLiveSource(route, hints), waiters: 0 };
     this.lives.set(route.stationSn, entry);
-    entry.source.catch(() => {
-      if (this.lives.get(route.stationSn) === entry) this.lives.delete(route.stationSn);
-    });
-    return entry.source;
+    entry.source.then(
+      (source) => {
+        entry.built = source;
+      },
+      () => {
+        if (this.lives.get(route.stationSn) === entry) this.lives.delete(route.stationSn);
+      },
+    );
+    return entry;
   }
 
-  private async buildLiveSource(route: RtcLiveRoute): Promise<SharedLiveSource> {
+  /**
+   * A caller gave up on the build. Once it lands, a source nobody attached to and nobody still awaits is
+   * disposed and its entry dropped, so it does not hold the station's play slot. The check runs a turn
+   * after the build, once every caller that got the source has attached.
+   */
+  private reapWhenBuilt(stationSn: string, entry: StationLive): void {
+    entry.source.then(
+      (source) =>
+        setImmediate(() => {
+          if (this.lives.get(stationSn) !== entry || entry.waiters > 0 || source.consumerCount > 0) return;
+          this.lives.delete(stationSn);
+          source.dispose();
+        }),
+      () => undefined,
+    );
+  }
+
+  private async buildLiveSource(route: RtcLiveRoute, hints: SharedSourceHints): Promise<SharedLiveSource> {
     const identity = this.deps.identity();
     if (!identity) throw new Error(`rtc: not logged in, cannot open ${route.stationSn}`);
     const accountId = route.adminUserId || identity.userId;
@@ -250,6 +281,8 @@ export class RtcCommandRouter {
         }),
       label: `${route.stationSn}#${route.channel}`,
       logger: this.deps.logger,
+      powered: hints.powered,
+      preBufferSeconds: hints.preBufferSeconds,
       onActive: () => {
         if (leased) return;
         leased = true;

@@ -389,6 +389,20 @@ describe("RtcCommandRouter live view", () => {
   const PORCH = cam("T8000P0000000003", 3);
   /** The live starts (inner cmd 1003) a session carried. */
   const starts = (s: FakeSession) => s.sent.map(sent).filter((p) => p.body.cmd === 1003);
+  /** The live stops (inner cmd 1004) a session carried. */
+  const stops = (s: FakeSession) => s.sent.map(sent).filter((p) => p.body.cmd === 1004);
+  /** A `1300` IDR on the play slot: the 22-byte media header (length, stream type 1, 1920x1080), then the video. */
+  const idr = () => {
+    const video = Buffer.from("000000012601af0e", "hex");
+    const header = Buffer.alloc(22);
+    header.writeUInt32LE(video.length, 0);
+    header[5] = 1;
+    header.writeUInt16LE(1920, 10);
+    header.writeUInt16LE(1080, 12);
+    const body = Buffer.concat([header, video]);
+    return Buffer.concat([buildPortalHeader(1300, body.length, 101, 0, 0), body]);
+  };
+  const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
 
   it("shares one pull between concurrent viewers of the same camera", async () => {
     const { router, sessions } = makeRouter();
@@ -429,14 +443,61 @@ describe("RtcCommandRouter live view", () => {
     }
   });
 
-  it("ends the viewers when the router closes, before the session goes", async () => {
+  it("ends the viewers when the router closes, sending the stop before the session goes", async () => {
     const { router, sessions } = makeRouter();
     const viewer = await router.mediaProviderFor(ORTO).live();
+    sessions[0]!.emit("mediaData", idr());
     const stopped = vi.fn();
+    const failed = vi.fn();
     viewer.on("stop", stopped);
+    viewer.on("error", failed);
     router.close();
-    await vi.waitFor(() => expect(stopped).toHaveBeenCalled());
+    expect(stopped).toHaveBeenCalled();
+    expect(failed).not.toHaveBeenCalled();
+    expect(stops(sessions[0]!)).toHaveLength(1);
     expect(sessions[0]!.closed).toBe(true);
+  });
+
+  it("bounds a battery camera's view to its budget, and leaves a wired one unbounded", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const { router, sessions } = makeRouter();
+    try {
+      const battery = await router.mediaProviderFor(ORTO).live({ powered: "battery" });
+      const notice = vi.fn();
+      battery.on("budget", notice);
+      sessions[0]!.emit("mediaData", idr());
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(notice).toHaveBeenCalledTimes(1);
+      battery.stop();
+      router.close();
+      const wired = makeRouter();
+      const viewer = await wired.router.mediaProviderFor(ORTO).live();
+      const unbounded = vi.fn();
+      viewer.on("budget", unbounded);
+      wired.sessions[0]!.emit("mediaData", idr());
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(unbounded).not.toHaveBeenCalled();
+      viewer.stop();
+      wired.router.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("frees the station for another camera when the only caller gave up during the bring-up", async () => {
+    const { router } = makeRouter();
+    try {
+      const gaveUp = new AbortController();
+      const pending = router.mediaProviderFor(ORTO).live({ signal: gaveUp.signal });
+      gaveUp.abort(new Error("caller left"));
+      await expect(pending).rejects.toThrow("caller left");
+      await nextTurn();
+      await nextTurn();
+      const viewer = await router.mediaProviderFor(PORCH).live();
+      viewer.stop();
+    } finally {
+      router.close();
+    }
   });
 
   it("honours an abort that lands during the bring-up, and one that came before the call", async () => {
