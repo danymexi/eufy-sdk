@@ -19,6 +19,8 @@ export const PortalLinkType = {
   COMMAND: 1,
   /** Station-originated frames: pushes, notify payloads, control results. */
   NOTIFY: 3,
+  /** Live video. */
+  LIVE: 5,
 } as const;
 
 export interface PortalHeader {
