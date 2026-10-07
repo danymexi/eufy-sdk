@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
+import { LiveSnapshotUnavailableError } from "../../../core/contracts.js";
 import { RtcCommandRouter, type RtcCommandRouterDeps, type RtcLiveRoute, type RtcRoute } from "../command-router.js";
 import type { RtcSession, RtcSessionOptions } from "../session.js";
 import { buildPortalHeader, parsePortalHeader, PortalLinkType, PORTAL_HEADER_LENGTH } from "../portal-packet.js";
@@ -412,6 +413,20 @@ describe("RtcCommandRouter live view", () => {
     try {
       const viewer = await router.mediaProviderFor(ORTO).live();
       await expect(router.mediaProviderFor(PORCH).live()).rejects.toThrow(/streams one camera at a time/);
+      viewer.stop();
+    } finally {
+      router.close();
+    }
+  });
+
+  it("refuses a second camera's live still as a source failure, so a retained still can answer", async () => {
+    const { router } = makeRouter();
+    try {
+      const viewer = await router.mediaProviderFor(ORTO).live();
+      const still = router.mediaProviderFor(PORCH).snapshotLive();
+      await expect(still).rejects.toBeInstanceOf(LiveSnapshotUnavailableError);
+      await expect(still).rejects.toMatchObject({ reason: "source-failed", retryable: true });
+      await expect(router.mediaProviderFor(PORCH).live()).rejects.not.toBeInstanceOf(LiveSnapshotUnavailableError);
       viewer.stop();
     } finally {
       router.close();

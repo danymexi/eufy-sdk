@@ -114,6 +114,17 @@ interface StationSession {
   leases: number;
 }
 
+/**
+ * A live start for one camera while the station streams another: the station streams one camera at a
+ * time. A live still refused this way is a {@link LiveSnapshotUnavailableError} with `source-failed`.
+ */
+class StationStreamBusyError extends Error {
+  constructor(stationSn: string, servingSn: string) {
+    super(`rtc live: ${stationSn} is serving ${servingSn}; the station streams one camera at a time`);
+    this.name = "StationStreamBusyError";
+  }
+}
+
 export class RtcCommandRouter {
   private readonly sessions = new Map<string, StationSession>();
   private readonly lives = new Map<string, StationLive>();
@@ -168,7 +179,13 @@ export class RtcCommandRouter {
         }
         return openReadableFromConsumer(consumer, opts);
       },
-      snapshotLive: async (opts) => this.snapshotLive(await attach(), opts?.timeoutMs ?? SNAPSHOT_TIMEOUT_MS),
+      snapshotLive: async (opts) => {
+        const consumer = await attach().catch((e: unknown) => {
+          if (!(e instanceof StationStreamBusyError)) throw e;
+          throw new LiveSnapshotUnavailableError("source-failed", e.message, { cause: e });
+        });
+        return this.snapshotLive(consumer, opts?.timeoutMs ?? SNAPSHOT_TIMEOUT_MS);
+      },
       record: async () => {
         throw new Error(`record is not available for ${route.cameraSn} over the T9000 control channel`);
       },
@@ -195,11 +212,7 @@ export class RtcCommandRouter {
     const current = this.lives.get(route.stationSn);
     if (current) {
       if (current.cameraSn === route.cameraSn) return current.source;
-      return Promise.reject(
-        new Error(
-          `rtc live: ${route.stationSn} is serving ${current.cameraSn}; the station streams one camera at a time`,
-        ),
-      );
+      return Promise.reject(new StationStreamBusyError(route.stationSn, current.cameraSn));
     }
     const entry: StationLive = { cameraSn: route.cameraSn, source: this.buildLiveSource(route) };
     this.lives.set(route.stationSn, entry);
