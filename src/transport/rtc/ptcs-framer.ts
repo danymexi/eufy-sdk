@@ -18,8 +18,8 @@
  *   28  payload             `payload length` bytes, then zeros to the packet size
  *
  * The format carries no forward error correction. The receiver completes a frame only when every index
- * up to the `last` one is present and their lengths add up; frames whose packets stop arriving are
- * dropped after {@link PTCS_STALE_MS}.
+ * up to the `last` one is present and their lengths add up. Incomplete frames are bounded by payload,
+ * fragment and frame counts, and dropped at their idle or absolute {@link PTCS_STALE_MS} deadline.
  */
 
 import { isPortalPacket, PortalLinkType } from "./portal-packet.js";
@@ -45,6 +45,12 @@ export function linkTypeForChannel(channel: number): number {
 
 /** How long a partly received frame is kept before it is dropped. */
 export const PTCS_STALE_MS = 15_000;
+
+/** Receive resource limits, independent of device frame-size claims. */
+const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+const MAX_PENDING_FRAMES = 32;
+const MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+const MAX_FRAGMENTS_PER_FRAME = 16_384;
 
 export interface PtcsHeader {
   channel: number;
@@ -102,15 +108,24 @@ export function packetize(
 
 interface Partial {
   channel: number;
+  sequence: number;
   frameLength: number;
   chunks: Map<number, Buffer>;
+  bytes: number;
+  maxIndex: number;
   lastIndex?: number;
+  created: number;
   touched: number;
 }
 
-/** Reassemble frames from wire packets, in any order, one frame at a time per (channel, id). */
+/**
+ * Bounded, out-of-order assembly per (channel, id). Identical duplicates are ignored; conflicting
+ * metadata or fragments discard the affected assembly. Capacity rejects new frames without evicting
+ * existing ones. Exceeding the payload budget discards the assembly receiving that fragment.
+ */
 export class PtcsReassembler {
   private readonly partials = new Map<string, Partial>();
+  private retainedBytes = 0;
 
   constructor(
     private readonly onFrame: (frame: Buffer, channel: number) => void,
@@ -120,39 +135,89 @@ export class PtcsReassembler {
   push(packet: Buffer): boolean {
     const h = parsePtcsHeader(packet);
     if (!h) return false;
-    const body = packet.subarray(PTCS_HEADER_LENGTH, PTCS_HEADER_LENGTH + h.payloadLength);
-    if (body.length !== h.payloadLength) return false;
-    const key = `${h.channel}:${h.frameId}`;
     const now = this.now();
+    this.expireAt(now);
+    const key = `${h.channel}:${h.frameId}`;
+    const body = packet.subarray(PTCS_HEADER_LENGTH, PTCS_HEADER_LENGTH + h.payloadLength);
+    if (
+      body.length !== h.payloadLength ||
+      h.frameLength > MAX_FRAME_BYTES ||
+      h.index >= MAX_FRAGMENTS_PER_FRAME ||
+      (h.frameLength === 0
+        ? h.index !== 0 || !h.last || body.length !== 0
+        : body.length === 0 || h.index >= h.frameLength)
+    ) {
+      this.drop(key);
+      return false;
+    }
     let p = this.partials.get(key);
+    if (
+      p &&
+      (p.frameLength !== h.frameLength ||
+        p.sequence !== h.sequence ||
+        (p.lastIndex !== undefined && (h.index > p.lastIndex || (h.last && h.index !== p.lastIndex))) ||
+        (h.last && h.index < p.maxIndex))
+    ) {
+      this.drop(key);
+      return false;
+    }
+    const previous = p?.chunks.get(h.index);
+    if (previous) {
+      if (previous.equals(body) && h.last === (p!.lastIndex === h.index)) return true;
+      this.drop(key);
+      return false;
+    }
+    if ((p?.bytes ?? 0) + body.length > h.frameLength || this.retainedBytes + body.length > MAX_BUFFERED_BYTES) {
+      this.drop(key);
+      return false;
+    }
     if (!p) {
-      p = { channel: h.channel, frameLength: h.frameLength, chunks: new Map(), touched: now };
+      if (this.partials.size >= MAX_PENDING_FRAMES) return false;
+      p = {
+        channel: h.channel,
+        sequence: h.sequence,
+        frameLength: h.frameLength,
+        chunks: new Map(),
+        bytes: 0,
+        maxIndex: h.index,
+        created: now,
+        touched: now,
+      };
       this.partials.set(key, p);
     }
     p.touched = now;
+    p.maxIndex = Math.max(p.maxIndex, h.index);
     p.chunks.set(h.index, Buffer.from(body));
+    p.bytes += body.length;
+    this.retainedBytes += body.length;
     if (h.last) p.lastIndex = h.index;
-    if (p.lastIndex === undefined) return true;
-    let total = 0;
+    if (p.lastIndex === undefined || p.chunks.size !== p.lastIndex + 1) return true;
+    this.drop(key);
+    if (p.bytes !== p.frameLength) return false;
     const parts: Buffer[] = [];
-    for (let i = 0; i <= p.lastIndex; i++) {
-      const c = p.chunks.get(i);
-      if (!c) return true;
-      parts.push(c);
-      total += c.length;
-    }
-    this.partials.delete(key);
-    if (total !== p.frameLength) return false;
-    this.onFrame(Buffer.concat(parts, total), p.channel);
+    for (let i = 0; i <= p.lastIndex; i++) parts.push(p.chunks.get(i)!);
+    this.onFrame(Buffer.concat(parts, p.bytes), p.channel);
     return true;
   }
 
-  /** Drop frames that stopped arriving; call periodically. */
+  /** Drop frames at their idle or absolute deadline. Also performed before admitting a packet. */
   expire(): void {
-    const now = this.now();
+    this.expireAt(this.now());
+  }
+
+  private expireAt(now: number): void {
     for (const [key, p] of this.partials) {
-      if (now - p.touched > PTCS_STALE_MS) this.partials.delete(key);
+      if (now - p.touched >= PTCS_STALE_MS || now - p.created >= PTCS_STALE_MS) {
+        this.drop(key);
+      }
     }
+  }
+
+  private drop(key: string): void {
+    const p = this.partials.get(key);
+    if (!p) return;
+    this.retainedBytes -= p.bytes;
+    this.partials.delete(key);
   }
 }
 
