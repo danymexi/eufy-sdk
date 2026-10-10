@@ -25,14 +25,12 @@ import {
   buildPortalPacket,
   parsePortalHeader,
   parsePortalPacket,
+  PORTAL_CMD_SET_PAYLOAD,
   PORTAL_HEADER_LENGTH,
+  PORTAL_STATION_CHANNEL,
   type SegmentCounter,
 } from "./portal-packet.js";
 
-/** The SET_PAYLOAD envelope. */
-const PORTAL_CMD_SET_PAYLOAD = 1350;
-/** The channel a station-wide command is addressed to. */
-const PORTAL_STATION_CHANNEL = 255;
 /** Inner `cmd` that starts a live view. */
 const LIVE_START = 1003;
 /** Inner `cmd` that stops it. */

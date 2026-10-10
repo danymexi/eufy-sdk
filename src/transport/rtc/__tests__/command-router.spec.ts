@@ -516,6 +516,54 @@ describe("RtcCommandRouter live view", () => {
     }
   });
 
+  it("lets another camera take the station while the first one's pull only lingers", async () => {
+    const { router } = makeRouter();
+    try {
+      const viewer = await router.mediaProviderFor(ORTO).live();
+      viewer.stop();
+      const next = await router.mediaProviderFor(PORCH).live();
+      next.stop();
+    } finally {
+      router.close();
+    }
+  });
+
+  it("refuses a caller whose abort lands after the source resolved, leaving the viewer in place", async () => {
+    const { router } = makeRouter();
+    try {
+      const media = router.mediaProviderFor(ORTO);
+      const viewer = await media.live();
+      const controller = new AbortController();
+      const pending = media.live({ signal: controller.signal });
+      queueMicrotask(() => controller.abort(new Error("caller left")));
+      await expect(pending).rejects.toThrow("caller left");
+      await expect(router.mediaProviderFor(PORCH).live()).rejects.toThrow(/streams one camera at a time/);
+      viewer.stop();
+    } finally {
+      router.close();
+    }
+  });
+
+  it("answers a live still whose stream fails as a source failure", async () => {
+    const sessions: FakeSession[] = [];
+    const { router } = makeRouter({
+      createSession: (opts) => {
+        const session = new FakeSession(opts);
+        session.behaviour = "nack";
+        sessions.push(session);
+        return session as unknown as RtcSession;
+      },
+    });
+    try {
+      const still = router.mediaProviderFor(ORTO).snapshotLive();
+      await expect(still).rejects.toBeInstanceOf(LiveSnapshotUnavailableError);
+      await expect(still).rejects.toMatchObject({ reason: "source-failed" });
+      expect(starts(sessions[0]!)).toHaveLength(1);
+    } finally {
+      router.close();
+    }
+  });
+
   it("has no wire for recording and leaves the optional media members absent", async () => {
     const { router } = makeRouter();
     const media = router.mediaProviderFor(ORTO);
