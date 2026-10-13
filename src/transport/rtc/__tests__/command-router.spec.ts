@@ -714,6 +714,8 @@ describe("RtcCommandRouter keepWarm", () => {
         router.close();
       }
     }));
+});
+
 describe("RtcCommandRouter database reads", () => {
   const TABLE = "history_record_info";
   const THUMB = "/zx/hdd_data0/Camera030000/event/202603/20260305/20260305081500_thumb.jpg";
