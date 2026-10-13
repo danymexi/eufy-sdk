@@ -37,6 +37,12 @@ export type RegionShard = "eu-pr" | "us-pr";
  * @internal
  */
 export interface MegaClientConfig {
+  /**
+   * The RTC signalling shard to use (for example `ie-pr`), overriding the one derived from the
+   * persisted `estimatedDomain`. A session saved before that domain was persisted derives the
+   * account's region shard, which the IE sign host refuses; this names the right shard directly.
+   */
+  rtcShard?: string;
   email: string;
   password: string;
   /** Two-letter account country code (e.g. "GB", "US", "DE"). Routes the region. */
@@ -458,6 +464,7 @@ export class MegaHttpClient {
    * like `ie-pr`, whose accounts need the IE sign host and cluster.
    */
   get rtcShard(): string {
+    if (this.cfg.rtcShard) return this.cfg.rtcShard;
     const m = /-([a-z]{2})(?:[.-]|$)/i.exec(this.estimatedDomain);
     return m ? `${m[1].toLowerCase()}-pr` : this.region;
   }
