@@ -15,15 +15,20 @@ import { traceCollector } from "./session-fixtures.js";
  * code, not anything session-internal.
  */
 let capturedResolveCipherKey: ((cipherId: number) => Promise<string | undefined>) | undefined;
+let capturedResolveRsaCipherKey: ((cipherId: number) => Promise<string | undefined>) | undefined;
 
 vi.mock("../p2p-session.js", async (importOriginal) => {
   const { EventEmitter } = await import("node:events");
   class FakeP2PSession extends EventEmitter {
     isConnected = true;
     hasLevel2Key = false;
-    constructor(opts: { resolveCipherKey: (cipherId: number) => Promise<string | undefined> }) {
+    constructor(opts: {
+      resolveCipherKey: (cipherId: number) => Promise<string | undefined>;
+      resolveRsaCipherKey?: (cipherId: number) => Promise<string | undefined>;
+    }) {
       super();
       capturedResolveCipherKey = opts.resolveCipherKey;
+      capturedResolveRsaCipherKey = opts.resolveRsaCipherKey;
     }
     connect = vi.fn(async () => {});
   }
@@ -104,6 +109,20 @@ describe("P2PCommandRouter.ensureStation — resolveCipherKey cache", () => {
     expect(await capturedResolveCipherKey!(97)).toBe("cafebabe");
 
     expect(traces).toMatchObject([{ phase: "cipher-fallback", cipherId: 97, answeredCipherId: 12 }]);
+  });
+
+  /**
+   * A cipher answered with an empty ECC key carries its RSA private key instead; both resolvers read the one
+   * lookup.
+   */
+  it("resolves the RSA private key of a cipher with no ECC key from the same lookup", async () => {
+    const getCiphers = vi.fn().mockResolvedValue([{ cipher_id: 10, ecc_private_key: "", private_key: "cnNhLWtleQ==" }]);
+    const router = new P2PCommandRouter(makeDeps(getCiphers));
+
+    await router.ensureStation(DEVICE.sn);
+    expect(await capturedResolveCipherKey!(10)).toBe("");
+    expect(await capturedResolveRsaCipherKey?.(10)).toBe("cnNhLWtleQ==");
+    expect(getCiphers).toHaveBeenCalledTimes(1);
   });
 
   /** Material for the cipher that was asked for is the ordinary answer and states nothing. */

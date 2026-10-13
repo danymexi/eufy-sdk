@@ -297,8 +297,8 @@ export class P2PCommandRouter {
    * shared — see {@link P2PCommandRouter.openTalkback}.
    */
   private readonly talkbacks = new Map<string, Talkback>();
-  /** cipher_id → ECC private key (one eufylife get_ciphers call per cipher), shared across (re)opens. */
-  private readonly cipherKeyCache = new Map<number, string | undefined>();
+  /** cipher_id → its ECC and RSA private keys (one eufylife get_ciphers call per cipher), shared across (re)opens. */
+  private readonly cipherKeyCache = new Map<number, { ecc?: string; rsa?: string }>();
   /** The recording download in flight per station; a station serves one at a time. */
   private readonly recordingDownloads = new Map<string, Promise<unknown>>();
 
@@ -534,6 +534,8 @@ export class P2PCommandRouter {
       noBroadcast: this.deps.noBroadcast,
       resolveCipherKey: (cipherId: number): Promise<string | undefined> =>
         this.cipherKeyFor(session, cipherId, adminUserId, stationSn),
+      resolveRsaCipherKey: async (cipherId: number): Promise<string | undefined> =>
+        (await this.cipherKeysFor(session, cipherId, adminUserId, stationSn))?.rsa,
       logger: this.deps.logger ?? noopLogger,
     });
     session.on("error", (e: Error) => this.reportError(e));
@@ -555,24 +557,35 @@ export class P2PCommandRouter {
     return session;
   }
 
-  /**
-   * The ECC private key of `cipherId`, from the router's cache or one `get_ciphers` call. When the cloud
-   * answers with another cipher, that one is used and traced on `session`. Only a successful lookup is
-   * cached.
-   */
+  /** The ECC private key of `cipherId` — see {@link cipherKeysFor}. */
   private async cipherKeyFor(
     session: P2PSession,
     cipherId: number,
     userId: string,
     stationSn: string,
   ): Promise<string | undefined> {
+    return (await this.cipherKeysFor(session, cipherId, userId, stationSn))?.ecc;
+  }
+
+  /**
+   * The ECC and RSA private keys of `cipherId` (`ecc_private_key`, `private_key`), from the router's cache
+   * or one `get_ciphers` call. When the cloud answers with another cipher that carries an ECC key and the
+   * asked one does not, that one is used and traced on `session`. Only a successful lookup — one that
+   * yields either key — is cached.
+   */
+  private async cipherKeysFor(
+    session: P2PSession,
+    cipherId: number,
+    userId: string,
+    stationSn: string,
+  ): Promise<{ ecc?: string; rsa?: string } | undefined> {
     if (this.cipherKeyCache.has(cipherId)) return this.cipherKeyCache.get(cipherId);
-    let ecc: string | undefined;
+    let cipher: { ecc_private_key?: string; private_key?: string } | undefined;
     try {
       const ciphers = await this.deps.mega.getCiphers([cipherId], userId, stationSn);
-      ecc = ciphers.find((c) => Number(c.cipher_id) === cipherId)?.ecc_private_key;
-      if (ecc === undefined && ciphers[0]?.ecc_private_key !== undefined) {
-        ecc = ciphers[0].ecc_private_key;
+      cipher = ciphers.find((c) => Number(c.cipher_id) === cipherId);
+      if (cipher?.ecc_private_key === undefined && ciphers[0]?.ecc_private_key !== undefined) {
+        cipher = ciphers[0];
         this.traceOnStation(session, {
           phase: "cipher-fallback",
           cipherId,
@@ -582,8 +595,10 @@ export class P2PCommandRouter {
     } catch (e) {
       this.deps.onError(e instanceof Error ? e : new Error(String(e)));
     }
-    if (ecc !== undefined) this.cipherKeyCache.set(cipherId, ecc);
-    return ecc;
+    if (cipher?.ecc_private_key === undefined && cipher?.private_key === undefined) return undefined;
+    const keys = { ecc: cipher.ecc_private_key, rsa: cipher.private_key };
+    this.cipherKeyCache.set(cipherId, keys);
+    return keys;
   }
 
   /**
