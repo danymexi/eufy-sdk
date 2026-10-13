@@ -31,6 +31,7 @@ import { captureSnapshotFromShared } from "../p2p/media.js";
 import { openReadableFromConsumer } from "../p2p/readable-egress.js";
 import { SharedLiveSource, attachUnlessAborted } from "../p2p/shared-live-source.js";
 import { RtcLiveStream } from "./live.js";
+import { PORTAL_KEEPALIVE, PORTAL_KEEPALIVE_MS } from "./portal-keepalive.js";
 import { RtcSession, type RtcSessionOptions } from "./session.js";
 import {
   buildPortalPacket,
@@ -115,6 +116,18 @@ interface StationSession {
   idle?: ReturnType<typeof setTimeout>;
   /** Live pulls holding the session open. */
   leases: number;
+  /** A {@link RtcCommandRouter.keepWarm} hold is suppressing the idle-close. */
+  warm?: boolean;
+}
+
+/**
+ * A {@link RtcCommandRouter.keepWarm} hold on one station: the keepalive timer sending
+ * {@link PORTAL_KEEPALIVE} and whether its disposer has run.
+ */
+interface WarmHold {
+  keepalive?: ReturnType<typeof setInterval>;
+  disposed: boolean;
+  dispose: () => void;
 }
 
 /**
@@ -131,6 +144,7 @@ class StationStreamBusyError extends Error {
 export class RtcCommandRouter {
   private readonly sessions = new Map<string, StationSession>();
   private readonly lives = new Map<string, StationLive>();
+  private readonly warm = new Map<string, WarmHold>();
 
   constructor(private readonly deps: RtcCommandRouterDeps) {}
 
@@ -420,9 +434,84 @@ export class RtcCommandRouter {
     });
   }
 
+  /**
+   * Hold a station's command session open and warm, so a command fires without the cold reconnect an
+   * idle-closed session pays — a reconnect that regularly overruns {@link CONNECT_TIMEOUT_MS}.
+   *
+   * Opens or reuses the station session, suppresses its idle-close ({@link IDLE_CLOSE_MS}) for the life
+   * of the hold, and sends {@link PORTAL_KEEPALIVE} on it every {@link PORTAL_KEEPALIVE_MS}. One hold per
+   * station: a second call for the same station answers the first call's disposer and arms no second
+   * timer. The hub grants one RTC session per account, so the hold keeps that one slot; when the session
+   * drops (a hangup, or the slot taken elsewhere) the keepalive stops and the hold clears, and the next
+   * command or `keepWarm` opens a fresh session rather than reopening in a loop.
+   *
+   * Answers an idempotent disposer that stops the keepalive and releases the hold, letting the idle-close
+   * resume.
+   */
+  keepWarm(route: RtcRoute): () => void {
+    const sn = route.stationSn;
+    const existing = this.warm.get(sn);
+    if (existing) return existing.dispose;
+    const hold: WarmHold = {
+      disposed: false,
+      dispose: () => {
+        if (hold.disposed) return;
+        hold.disposed = true;
+        if (this.warm.get(sn) === hold) this.warm.delete(sn);
+        if (hold.keepalive) clearInterval(hold.keepalive);
+        hold.keepalive = undefined;
+        const st = this.sessions.get(sn);
+        if (st?.warm) {
+          st.warm = false;
+          this.touch(sn, st);
+        }
+      },
+    };
+    this.warm.set(sn, hold);
+    void this.warmUp(sn, route, hold);
+    return hold.dispose;
+  }
+
+  /**
+   * Bring a station session up for a {@link keepWarm} hold and start its keepalive. A bring-up that fails,
+   * or a hold disposed before it completes, clears the hold and arms no timer. The keepalive stops when
+   * the session closes, which also clears the hold so the next command or `keepWarm` rebuilds cleanly.
+   */
+  private async warmUp(sn: string, route: RtcRoute, hold: WarmHold): Promise<void> {
+    const identity = this.deps.identity();
+    if (!identity) {
+      if (this.warm.get(sn) === hold) this.warm.delete(sn);
+      return;
+    }
+    const adminUserId = route.adminUserId || identity.userId;
+    let st: StationSession;
+    try {
+      st = await this.stationSession(route, adminUserId, identity);
+    } catch (e) {
+      if (this.warm.get(sn) === hold) this.warm.delete(sn);
+      this.deps.onError?.(e instanceof Error ? e : new Error(String(e)));
+      return;
+    }
+    if (hold.disposed) {
+      this.touch(sn, st);
+      return;
+    }
+    st.warm = true;
+    this.touch(sn, st);
+    st.session.once("close", () => {
+      if (hold.keepalive) clearInterval(hold.keepalive);
+      hold.keepalive = undefined;
+      if (this.warm.get(sn) === hold) this.warm.delete(sn);
+    });
+    hold.keepalive = setInterval(() => {
+      if (!st.session.sendRaw(PORTAL_KEEPALIVE)) this.deps.logger?.warn?.(`[rtc] ${sn} warm keepalive not sent`);
+    }, PORTAL_KEEPALIVE_MS);
+    hold.keepalive.unref?.();
+  }
+
   private touch(sn: string, st: StationSession): void {
     if (st.idle) clearTimeout(st.idle);
-    if (st.leases > 0) return;
+    if (st.leases > 0 || st.warm) return;
     st.idle = setTimeout(() => this.drop(sn, st), IDLE_CLOSE_MS);
     st.idle.unref?.();
   }

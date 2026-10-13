@@ -1743,6 +1743,23 @@ export class EufyMega extends EventEmitter {
     await this.p2p.ensureStation(this.p2p.stationKeyOf(deviceSn), signal);
   }
 
+  /**
+   * Keep a T9000 station's RTC command session open and warm, so a command fires without the cold
+   * reconnect an idle-closed session pays. Opens or reuses the session, suppresses its idle-close, and
+   * sends the portal keepalive on it; the hub grants one RTC session per account, so the hold keeps that
+   * slot, and a drop (a hangup, or the slot taken elsewhere) ends the keepalive until the next command or
+   * call reopens the session.
+   *
+   * Answers an idempotent disposer that releases the hold and lets the idle-close resume. A station that
+   * is not a T9000 is reached over a session that does not idle out this way and answers a no-op disposer.
+   */
+  keepStationWarm(stationSn: string): () => void {
+    const { t9000 } = this.stationOf(stationSn);
+    const route = this.rtcRouteFor(stationSn);
+    if (!t9000 || !route) return () => {};
+    return this.rtc.keepWarm(route);
+  }
+
   /** Eagerly open P2P sessions for WIRED stations only (persistent — they don't drain). Battery
    *  stations stay closed until an on-demand open. Best-effort per station. */
   private async warmWiredP2P(

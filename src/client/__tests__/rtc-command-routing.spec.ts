@@ -176,6 +176,35 @@ describe("station-owned RTC command routing", () => {
   });
 });
 
+describe("keepStationWarm", () => {
+  const warmInternals = (internals: unknown) =>
+    internals as {
+      rtc: { keepWarm(route: RtcRoute): () => void };
+      keepStationWarm(stationSn: string): () => void;
+    };
+
+  it("holds a T9000 station warm through the router with its station identity", () => {
+    const { internals } = fixture();
+    const disposer = vi.fn();
+    const keepWarm = vi.spyOn(warmInternals(internals).rtc, "keepWarm").mockReturnValue(disposer);
+    expect(warmInternals(internals).keepStationWarm(HUB)).toBe(disposer);
+    expect(keepWarm).toHaveBeenCalledExactlyOnceWith({
+      stationSn: HUB,
+      adminUserId: "synthetic-admin",
+      attached: false,
+    });
+  });
+
+  it("answers a no-op disposer for a station that is not a T9000, without touching the router", () => {
+    const { internals } = fixture(DeviceType.HB3);
+    const keepWarm = vi.spyOn(warmInternals(internals).rtc, "keepWarm");
+    const disposer = warmInternals(internals).keepStationWarm(HUB);
+    expect(typeof disposer).toBe("function");
+    expect(() => disposer()).not.toThrow();
+    expect(keepWarm).not.toHaveBeenCalled();
+  });
+});
+
 describe("command context of a device behind a station", () => {
   /** The context a capability gets, from the record the command sink already holds. */
   const contextOf = (internals: unknown, sn: string, model: string) =>
