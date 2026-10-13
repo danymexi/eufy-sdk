@@ -88,6 +88,8 @@ import type {
   RealtimeReadiness,
   StationFace,
   StationFacesOptions,
+  StationReadOptions,
+  StationTableOptions,
   WaitForRealtimeOptions,
 } from "./types.js";
 
@@ -101,6 +103,8 @@ export type {
   RealtimeReadiness,
   StationFace,
   StationFacesOptions,
+  StationReadOptions,
+  StationTableOptions,
   WaitForRealtimeOptions,
 } from "./types.js";
 
@@ -2036,6 +2040,66 @@ export class EufyMega extends EventEmitter {
 
     const rows = await session.readDatabase("person_basic_info", { accountId, ...opts });
     return rows.filter((row): row is StationFace => typeof row === "object" && row !== null);
+  }
+
+  /**
+   * The rows of one of a station's own tables (`history_record_info`, `person_basic_info`, …), read over
+   * the transport the station speaks: the control channel of a HomeBase S1 Pro (T9000), P2P for any
+   * other station. The query is the table's whole content unless `opts.innerCmd` and `opts.query` state
+   * another; the rows are the station's, shaped by it.
+   *
+   * Resolves with the rows the station returned. Rejects on a serial not in the device list, on a record
+   * stating no `admin_user_id`, on a station that cannot be reached, on a query the station refuses, and
+   * on the reply not arriving in time. Assembling the reply is the transport's; this resolves which
+   * station, which transport and which account id.
+   */
+  async readStationTable(stationSn: string, table: string, opts: StationTableOptions = {}): Promise<unknown[]> {
+    const { station, accountId, route } = await this.stationReadTarget("readStationTable", stationSn);
+    if (route) return this.rtc.readTable(route, table, opts);
+    const session = await this.p2pStationSession("readStationTable", station, opts.signal);
+    return session.readDatabase(table, { accountId, ...opts });
+  }
+
+  /**
+   * One image stored on a station, by the on-station path a table row or a push payload names
+   * (`thumb_path`, `pic_filepath`, `cover_path`, …), read over the transport the station speaks: the
+   * control channel of a HomeBase S1 Pro (T9000), P2P for any other station.
+   *
+   * Resolves with the image bytes as the station holds them. Rejects on a serial not in the device
+   * list, on a record stating no `admin_user_id`, on a station that cannot be reached, and on the reply
+   * not arriving in time. Fetching the image is the transport's; this resolves which station, which
+   * transport and which account id.
+   */
+  async readStationImage(stationSn: string, filePath: string, opts: StationReadOptions = {}): Promise<Buffer> {
+    const { station, accountId, route } = await this.stationReadTarget("readStationImage", stationSn);
+    if (route) return this.rtc.readImage(route, filePath, opts);
+    const session = await this.p2pStationSession("readStationImage", station, opts.signal);
+    return session.readImage(filePath, { accountId, ...opts });
+  }
+
+  /**
+   * The station a database read goes to, its `admin_user_id` and, for a T9000, its RTC route. Throws,
+   * prefixed with `op`, on a serial the device list does not carry and on a record stating no admin id.
+   */
+  private async stationReadTarget(
+    op: string,
+    stationSn: string,
+  ): Promise<{ station: string; accountId: string; route: RtcRoute | undefined }> {
+    if (!this.registry.list().length) await this.getDevices();
+    const station = this.p2p.stationKeyOf(stationSn);
+    const found = this.stationOf(station);
+    if (!found.station) throw new Error(`${op}: ${station} is not in the device list`);
+    const accountId = this.adminUserIdOf(station);
+    if (!accountId) throw new Error(`${op}: no admin_user_id on record for ${station}`);
+    return { station, accountId, route: found.t9000 ? this.rtcRouteFor(station) : undefined };
+  }
+
+  /** The station's P2P session, brought up; throws, prefixed with `op`, when none can be had. */
+  private async p2pStationSession(op: string, station: string, signal?: AbortSignal): Promise<P2PSession> {
+    await this.p2p.ensureStation(station, signal);
+    const session = this.p2p.getSessions().get(station);
+    if (!session) throw new Error(`${op}: no P2P session for ${station}`);
+    return session;
   }
 
   /** The station's own `admin_user_id`, which its database refuses the query without. */

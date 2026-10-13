@@ -1733,6 +1733,40 @@ export class P2PSession extends EventEmitter {
   }
 
   /**
+   * Fetch one stored image by its on-station path and answer its bytes, once the reply arrives.
+   *
+   * The request half is {@link requestImage}; the reply is the `image` event whose `file` equals
+   * `filePath`, as the station echoes the requested path in its `CMD_DATABASE_IMAGE` frame. Rejects when
+   * `signal` aborts and when `timeoutMs` (default {@link DB_TABLE_TIMEOUT_MS}) elapses with no reply.
+   */
+  async readImage(
+    filePath: string,
+    opts: { accountId?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+  ): Promise<Buffer> {
+    if (opts.signal?.aborted) throw new Error("readImage: aborted");
+    this.requestImage(filePath, { accountId: opts.accountId });
+    return new Promise<Buffer>((resolve, reject) => {
+      const onImage = (image: { file: string; data: Buffer }): void => {
+        if (image.file === filePath) settle(() => resolve(image.data));
+      };
+      const timer = setTimeout(
+        () => settle(() => reject(new Error(`readImage: ${this.cfg.stationSn} sent no image for ${filePath}`))),
+        opts.timeoutMs ?? DB_TABLE_TIMEOUT_MS,
+      );
+      const onAbort = (): void => settle(() => reject(new Error("readImage: aborted")));
+      const settle = (finish: () => void): void => {
+        clearTimeout(timer);
+        this.off("image", onImage);
+        opts.signal?.removeEventListener("abort", onAbort);
+        finish();
+      };
+
+      this.on("image", onImage);
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  /**
    * Query an on-station database table over P2P (edge-AI face DB, event records, …).
    * Sends `CMD_SET_PAYLOAD{cmd:CMD_DATABASE, payload:{cmd:DB_QUERY.FULL_TABLE, table}}`.
    * The HomeBase streams back `CMD_DATABASE` (1306) frames `{cmd:10000,count,data:[…]}`,

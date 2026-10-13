@@ -14,6 +14,11 @@
  * a live pull holds it open. Sends on a session are serialised; an ACK is correlated by its outer command
  * and segment, since it carries no inner command. An ACK is not an observation of the resulting state.
  *
+ * The station's own database is read over the same channel: a `set-payload` with inner `1306`
+ * (CMD_DATABASE) answers a table and inner `1308` (CMD_DATABASE_IMAGE) a stored image, each as one
+ * notify frame carrying the whole document, zstd-compressed when large. The notify link carries
+ * unrelated station reports between them, so a reply is matched by its content, never by arrival order.
+ *
  * Live view of an attached camera rides the same session (the hub accepts one RTC session per account),
  * through one shared live source per station: the station serves one camera at a time, so a second
  * camera is refused until the first one's view ends.
@@ -47,8 +52,34 @@ const PORTAL_CMD_CONTROL_PAYLOAD = 1700;
 /** The envelope carrying a correlated JSON control result. */
 const PORTAL_CMD_NOTIFY_PAYLOAD = 1351;
 
+/** CMD_DATABASE: the inner command that queries one on-station table. */
+const CMD_DATABASE = 1306;
+/** CMD_DATABASE_IMAGE: the inner command that fetches one stored image by its on-station path. */
+const CMD_DATABASE_IMAGE = 1308;
+/** The inner query cmd reading one table whole. */
+const DB_QUERY_FULL_TABLE = 10000;
+/** The query params the vendor app sends with inner cmd `10000`: the whole table, `count` rows at most. */
+const FULL_TABLE_QUERY: Record<string, unknown> = {
+  count: 2000,
+  start_date: "",
+  end_date: "",
+  start_id: 0,
+  end_id: 1,
+  flag: 0,
+  need_ai: 1,
+  res_unzip: 1,
+  update_time: "0",
+  start_time: "0",
+  alarm_id: "",
+};
+
 /** How long a command waits for its envelope ACK. */
 const ACK_TIMEOUT_MS = 8_000;
+/**
+ * How long a database read waits for its notify reply, when the caller states no bound. A hub answers
+ * a twenty-row page or a stored cover within about a second; one that stays silent is not answering.
+ */
+const DATABASE_REPLY_TIMEOUT_MS = 15_000;
 /**
  * How long a session has to come up. A healthy hub answers in ~2 s; the bound sits under the ~15 s a
  * service call is commonly given, so a hub outage surfaces as this router's error.
@@ -78,6 +109,21 @@ export interface RtcRoute {
   adminUserId?: string;
   /** True for a device attached to the station, which keeps the command's own channel. */
   attached: boolean;
+}
+
+/** How long a database read waits for its reply, and how to give up early. */
+export interface RtcReadOptions {
+  /** Default {@link DATABASE_REPLY_TIMEOUT_MS}. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** The query a table read carries. */
+export interface RtcTableReadOptions extends RtcReadOptions {
+  /** The inner query cmd; default `10000`, the whole table. */
+  innerCmd?: number;
+  /** The query params nested under the table; default the vendor app's full-table params. */
+  query?: Record<string, unknown>;
 }
 
 /** The camera a live view is for, on its station's route. */
@@ -169,6 +215,54 @@ export class RtcCommandRouter {
     const run = st.queue.then(() => this.sendAwaitAck(stationSn, st, packet, outerCmd, innerCmd, channel, segment));
     st.queue = run.catch(() => undefined);
     return run;
+  }
+
+  /**
+   * Query one on-station table over the station's control channel and answer its rows.
+   *
+   * Sends the `1350` envelope with inner `{cmd: 1306, payload: {cmd, table, payload: query, transaction}}`
+   * on the station channel, `transaction` being the send time in milliseconds. The hub ACKs on the
+   * command link and answers with one notify frame whose body carries `{cmd, table, data, mIntRet, …}`;
+   * the reply is the one echoing this read's `transaction`, or, when it carries none, the one naming
+   * `table`. Resolves with its `data` rows. Rejects with the hub's `msg` on a non-zero `mIntRet`, on
+   * an ACK refusing the envelope, when `signal` aborts, when the session closes, and when `timeoutMs`
+   * (default {@link DATABASE_REPLY_TIMEOUT_MS}) elapses with no reply.
+   *
+   * One read or command at a time per station: the read holds the station's send queue until its reply.
+   */
+  readTable(route: RtcRoute, table: string, opts: RtcTableReadOptions = {}): Promise<unknown[]> {
+    const transaction = String(Date.now());
+    const inner = {
+      cmd: opts.innerCmd ?? DB_QUERY_FULL_TABLE,
+      table,
+      payload: opts.query ?? FULL_TABLE_QUERY,
+      transaction,
+    };
+    return this.readOverStation(route, CMD_DATABASE, inner, opts, (body) => {
+      const ours = "transaction" in body ? String(body.transaction) === transaction : body.table === table;
+      if (!ours) return undefined;
+      if (typeof body.mIntRet === "number" && body.mIntRet !== 0) {
+        throw new Error(`rtc: ${route.stationSn} refused ${table}: ${body.msg ?? body.mIntRet} (${body.mIntRet})`);
+      }
+      return Array.isArray(body.data) ? body.data : undefined;
+    });
+  }
+
+  /**
+   * Fetch one stored image by its on-station path over the station's control channel.
+   *
+   * Sends the `1350` envelope with inner `{cmd: 1308, payload: [{file}]}` on the station channel. The hub
+   * ACKs on the command link and answers with one notify frame whose body is `{file, content}`, `content`
+   * the image in base64; the reply is the one whose `file` equals `filePath`. Resolves with the decoded
+   * bytes. Rejects on an ACK refusing the envelope, when `signal` aborts, when the session closes, and
+   * when `timeoutMs` (default {@link DATABASE_REPLY_TIMEOUT_MS}) elapses with no reply.
+   *
+   * One read or command at a time per station: the read holds the station's send queue until its reply.
+   */
+  readImage(route: RtcRoute, filePath: string, opts: RtcReadOptions = {}): Promise<Buffer> {
+    return this.readOverStation(route, CMD_DATABASE_IMAGE, [{ file: filePath }], opts, (body) =>
+      body.file === filePath && typeof body.content === "string" ? Buffer.from(body.content, "base64") : undefined,
+    );
   }
 
   /**
@@ -347,6 +441,106 @@ export class RtcCommandRouter {
       };
       st.session.on("commandData", onData);
       st.session.on("close", onClose);
+      if (!st.session.sendCommand(packet)) {
+        cleanup();
+        reject(new Error(`rtc: ${sn} command channel not open, cmd ${innerCmd} not sent`));
+      }
+    });
+  }
+
+  /**
+   * Send one `1350` envelope with `innerCmd` and `payload` on the station channel and answer the notify
+   * reply `pick` claims: the first notify body (an object) for which `pick` answers a value resolves with
+   * it, one `pick` throws on rejects with that error, and every other notify frame is left alone. An ACK
+   * with a non-zero result code rejects too. Queued behind the station's other sends and holding the
+   * queue until settled.
+   */
+  private async readOverStation<T>(
+    route: RtcRoute,
+    innerCmd: number,
+    payload: unknown,
+    opts: RtcReadOptions,
+    pick: (body: Record<string, unknown>) => T | undefined,
+  ): Promise<T> {
+    opts.signal?.throwIfAborted();
+    const identity = this.deps.identity();
+    if (!identity) throw new Error(`rtc: not logged in, cannot read from ${route.stationSn}`);
+    const adminUserId = route.adminUserId || identity.userId;
+    const st = await abortable(this.stationSession(route, adminUserId, identity), opts.signal);
+    const segment = st.seg.next();
+    const packet = buildPortalPacket({
+      commandId: PORTAL_CMD_SET_PAYLOAD,
+      channel: PORTAL_STATION_CHANNEL,
+      segment,
+      payload: { account_id: adminUserId, cmd: innerCmd, mValue3: 0, payload },
+    });
+    const run = st.queue.then(() => this.sendAwaitReply(route.stationSn, st, packet, innerCmd, segment, opts, pick));
+    st.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** The send and the wait behind {@link readOverStation}, bounded by `opts.timeoutMs` and `opts.signal`. */
+  private sendAwaitReply<T>(
+    sn: string,
+    st: StationSession,
+    packet: Buffer,
+    innerCmd: number,
+    segment: number,
+    opts: RtcReadOptions,
+    pick: (body: Record<string, unknown>) => T | undefined,
+  ): Promise<T> {
+    const timeoutMs = opts.timeoutMs ?? DATABASE_REPLY_TIMEOUT_MS;
+    return new Promise<T>((resolve, reject) => {
+      const onData = (frame: Buffer, linkType: number) => {
+        const p = parsePortalPacket(frame, linkType);
+        if (!p) return;
+        if (linkType === PortalLinkType.COMMAND) {
+          if (p.segment !== segment || p.commandId !== PORTAL_CMD_SET_PAYLOAD || !p.isResponse || p.errCode === 0)
+            return;
+          cleanup();
+          reject(new Error(`rtc: ${sn} rejected cmd ${innerCmd} (err ${p.errCode})`));
+          return;
+        }
+        if (linkType !== PortalLinkType.NOTIFY || typeof p.data !== "object" || p.data === null) return;
+        let picked: T | undefined;
+        try {
+          picked = pick(p.data as Record<string, unknown>);
+        } catch (e) {
+          cleanup();
+          reject(e instanceof Error ? e : new Error(String(e)));
+          return;
+        }
+        if (picked === undefined) return;
+        cleanup();
+        this.deps.logger?.debug?.(`[rtc] ${sn} cmd ${innerCmd} answered`);
+        resolve(picked);
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error(`rtc: ${sn} session closed while waiting for cmd ${innerCmd} reply`));
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(opts.signal?.reason ?? new Error(`rtc: cmd ${innerCmd} aborted`));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`rtc: ${sn} cmd ${innerCmd} reply timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        st.session.off("commandData", onData);
+        st.session.off("close", onClose);
+        opts.signal?.removeEventListener("abort", onAbort);
+        this.touch(sn, st);
+      };
+      if (opts.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      st.session.on("commandData", onData);
+      st.session.on("close", onClose);
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
       if (!st.session.sendCommand(packet)) {
         cleanup();
         reject(new Error(`rtc: ${sn} command channel not open, cmd ${innerCmd} not sent`));

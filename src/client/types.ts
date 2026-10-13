@@ -254,6 +254,21 @@ export interface StationFacesOptions {
   signal?: AbortSignal;
 }
 
+/** How long to wait for a station's reply to a read, and how to give up early. */
+export interface StationReadOptions {
+  /** Default 15s. A station that will not answer says nothing. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** The query a station table read carries, and its bound. */
+export interface StationTableOptions extends StationReadOptions {
+  /** The inner query cmd; default `10000`, the whole table. */
+  innerCmd?: number;
+  /** The query params nested under the table; default the vendor app's full-table params. */
+  query?: Record<string, unknown>;
+}
+
 /**
  * A single semantic event tagged with its name — the payload of the catch-all `"event"` listener.
  * A discriminated union over {@link DeviceEventMap}, so switching on `e.eventName` narrows `e` to that
