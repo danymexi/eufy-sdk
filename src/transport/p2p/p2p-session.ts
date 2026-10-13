@@ -300,14 +300,15 @@ const CMD_NOTIFY_PAYLOAD = 1351;
 const PADDED_RESULT_BYTES = 132;
 /** CMD_CAMERA_INFO — a camera reporting its OWN params, as a root-level array. */
 const CMD_CAMERA_INFO = 1103;
-const CMD_DATABASE_IMAGE = 1308;
-/** CMD_DATABASE (1306) — P2P SQLite-ish query; reply carries `{cmd:10000,count,data:[…]}`. */
-const CMD_DATABASE = 1306;
+/** CMD_DATABASE_IMAGE (1308) — fetch one stored image by its on-station path. */
+export const CMD_DATABASE_IMAGE = 1308;
+/** CMD_DATABASE (1306) — query one on-station table; reply carries `{cmd:10000,count,data:[…]}`. */
+export const CMD_DATABASE = 1306;
 /**
  * Inner query cmds carried in a {@link CMD_DATABASE} payload. `FULL_TABLE` reads one table whole;
  * `COMBINATION_WITH_AI` is the AI event-history read that bundles the face roster.
  */
-const DB_QUERY = { FULL_TABLE: 10000, COMBINATION_WITH_AI: 10011, QUERY_LOCAL: 10017 } as const;
+export const DB_QUERY = { FULL_TABLE: 10000, COMBINATION_WITH_AI: 10011, QUERY_LOCAL: 10017 } as const;
 /** AAD for the level-2 (gateway/"signCode 8") AES-256-GCM frames — fixed across all eufy P2P. */
 const GCM_AAD = Buffer.from("eufy security");
 
@@ -400,8 +401,28 @@ export interface P2PFrame extends P2PDataFrameHeader {
 /** Per-process counter behind {@link P2PSession.traceId} — see it for why this is not a serial. */
 let traceSequence = 0;
 
+/**
+ * The query params the vendor app sends with a whole-table `CMD_DATABASE` read (inner `cmd 10000`).
+ * `count` bounds the row count.
+ */
+export function fullTableQuery(count = 2000): Record<string, unknown> {
+  return {
+    count,
+    start_date: "",
+    end_date: "",
+    start_id: 0,
+    end_id: 1,
+    flag: 0,
+    need_ai: 1,
+    res_unzip: 1,
+    update_time: "0",
+    start_time: "0",
+    alarm_id: "",
+  };
+}
+
 /** How long a station's database reply has to arrive whole, when the caller states no bound. */
-const DB_TABLE_TIMEOUT_MS = 15_000;
+export const DB_TABLE_TIMEOUT_MS = 15_000;
 
 /**
  * The rows or refusal code of the first complete table document in an accumulated `CMD_DATABASE` reply.
@@ -2059,26 +2080,6 @@ export class P2PSession extends EventEmitter {
   }
 
   /**
-   * Standard "give me the whole table" query params the eufy app uses for a direct
-   * `CMD_DATABASE` read (inner `cmd 10000`). `count` bounds the row count.
-   */
-  private fullTableQuery(count = 2000): Record<string, unknown> {
-    return {
-      count,
-      start_date: "",
-      end_date: "",
-      start_id: 0,
-      end_id: 1,
-      flag: 0,
-      need_ai: 1,
-      res_unzip: 1,
-      update_time: "0",
-      start_time: "0",
-      alarm_id: "",
-    };
-  }
-
-  /**
    * Request the on-device edge-AI **face roster** over P2P — the phone-free path.
    *
    * NOT a dedicated face command (the `1194`/`1195` path never responds on a HomeBase). The
@@ -2094,7 +2095,7 @@ export class P2PSession extends EventEmitter {
       accountId: opts.accountId,
       channel: opts.channel,
       innerCmd: DB_QUERY.FULL_TABLE,
-      query: this.fullTableQuery(),
+      query: fullTableQuery(),
     });
   }
 
@@ -2158,7 +2159,7 @@ export class P2PSession extends EventEmitter {
     this.queryDatabase(table, {
       accountId: opts.accountId,
       innerCmd: opts.innerCmd,
-      query: opts.query ?? this.fullTableQuery(),
+      query: opts.query ?? fullTableQuery(),
     });
     this.dbReadInFlight = true;
     try {
@@ -2205,7 +2206,7 @@ export class P2PSession extends EventEmitter {
       accountId: opts.accountId,
       channel: opts.channel,
       innerCmd: DB_QUERY.FULL_TABLE,
-      query: this.fullTableQuery(),
+      query: fullTableQuery(),
     });
   }
 
