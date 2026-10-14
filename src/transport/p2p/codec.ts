@@ -252,20 +252,18 @@ export function deriveLevel2KeyFromGatewayInfo(gwPayload: Buffer, eccPrivateKeyH
 }
 
 /**
- * The RSA private key of a `get_ciphers` `private_key`: base64 DER, PKCS#8 or PKCS#1, with or without
- * PEM armour lines. Answers `undefined` when it parses as neither.
+ * The RSA private key of a `get_ciphers` `private_key`: base64 PKCS#8 DER, 1024-bit on the T8790's cipher 10.
+ * Armour lines (`-----…-----`) and whitespace are removed before decoding, as eufy-security-client does with
+ * the same field. Answers `undefined` when it does not parse as a PKCS#8 RSA key.
  */
 function rsaPrivateKeyFrom(material: string): KeyObject | undefined {
   const der = Buffer.from(material.replace(/-----[^-]*-----/g, "").replace(/\s+/g, ""), "base64");
-  for (const type of ["pkcs8", "pkcs1"] as const) {
-    try {
-      const key = createPrivateKey({ key: der, format: "der", type });
-      if (key.asymmetricKeyType === "rsa") return key;
-    } catch {
-      continue;
-    }
+  try {
+    const key = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+    return key.asymmetricKeyType === "rsa" ? key : undefined;
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
 
 /**

@@ -6,6 +6,7 @@ import {
   DEVICE_SN,
   STATION_SN as ROUTER_STATION_SN,
   routerWithSession,
+  traceCollector,
   type FakeP2PSession,
 } from "./session-fixtures.js";
 
@@ -24,7 +25,12 @@ const SESSION_KEY = Buffer.from("00112233445566778899aabbccddeeff", "hex");
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 1024 });
 const PKCS8_B64 = privateKey.export({ type: "pkcs8", format: "der" }).toString("base64");
-const PKCS1_PEM = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+/** The PKCS#8 DER in 64-column lines under the armour eufy-security-client strips from this field. */
+const PKCS8_ARMOURED = [
+  "-----BEGIN RSA PRIVATE KEY-----",
+  ...(PKCS8_B64.match(/.{1,64}/g) ?? []),
+  "-----END RSA PRIVATE KEY-----",
+].join("\n");
 
 /** `cipher_id(2 LE) ‖ 0000 ‖ ciphertext ‖ 00 ‖ trailing bytes`, the decrypted gateway-info layout. */
 function gatewayInfo(ciphertext: Buffer, cipherId = CIPHER_ID): Buffer {
@@ -48,8 +54,8 @@ describe("deriveLevel2KeyFromRsaGatewayInfo", () => {
     expect(deriveLevel2KeyFromRsaGatewayInfo(gatewayInfo(wrapped()), PKCS8_B64)).toEqual(SESSION_KEY);
   });
 
-  test("recovers it with a PEM-armoured PKCS#1 private key", () => {
-    expect(deriveLevel2KeyFromRsaGatewayInfo(gatewayInfo(wrapped()), PKCS1_PEM)).toEqual(SESSION_KEY);
+  test("recovers it with the base64 PKCS#8 DER under armour lines and line breaks", () => {
+    expect(deriveLevel2KeyFromRsaGatewayInfo(gatewayInfo(wrapped()), PKCS8_ARMOURED)).toEqual(SESSION_KEY);
   });
 
   test("answers undefined for a payload shorter than the modulus", () => {
@@ -95,27 +101,56 @@ type SessionInternals = {
   send: (addr: unknown, type: Buffer, payload: Buffer) => void;
 };
 
-/** A session whose cipher answers an empty ECC key and the spec's RSA key, negotiated from a gateway info. */
-async function negotiatedSession(stationSn = STATION_SN): Promise<{ session: P2PSession; ready: unknown[] }> {
+/** A session whose cipher answers an empty ECC key and the spec's RSA key, with its emitted events and traces. */
+function rsaSession(stationSn = STATION_SN): {
+  session: P2PSession;
+  ready: unknown[];
+  traces: ReturnType<typeof traceCollector>["traces"];
+} {
+  const { logger, traces } = traceCollector();
   const session = new P2PSession({
     stationSn,
     p2pDid: P2P_DID,
+    logger,
     resolveCipherKeys: async (cipherId) => (cipherId === CIPHER_ID ? { ecc: "", rsa: PKCS8_B64 } : undefined),
   });
   const ready: unknown[] = [];
   session.on("level2Ready", (e) => ready.push(e));
-  (session as unknown as SessionInternals).negotiateLevel2Key(gatewayInfo(wrapped()));
-  await session.awaitLevel2Key(1_000, "call", "set-payload");
-  return { session, ready };
+  return { session, ready, traces };
+}
+
+/** {@link rsaSession}, negotiated from a gateway info. */
+async function negotiatedSession(stationSn = STATION_SN): Promise<ReturnType<typeof rsaSession>> {
+  const built = rsaSession(stationSn);
+  (built.session as unknown as SessionInternals).negotiateLevel2Key(gatewayInfo(wrapped()));
+  await built.session.awaitLevel2Key(1_000, "call", "set-payload");
+  return built;
 }
 
 describe("P2PSession level-2 over an RSA cipher", () => {
-  test("a cipher with no ECC key and an RSA key makes level 2 ready", async () => {
-    const { session, ready } = await negotiatedSession();
+  /** The ECB key serves the set-payload sender alone, so it is not announced as the level-2 key. */
+  test("a cipher with no ECC key and an RSA key serves set-payload without announcing level 2 ready", async () => {
+    const { session, ready, traces } = await negotiatedSession();
     expect(await session.awaitLevel2Key(0, "call", "set-payload")).toBe(true);
-    expect(await session.awaitLevel2Key(0)).toBe(false);
     expect(session.hasLevel2Key).toBe(false);
-    expect(ready).toEqual([{ cipherId: CIPHER_ID }]);
+    expect(ready).toEqual([]);
+    expect(traces.filter((trace) => trace.phase === "level2-ready")).toEqual([]);
+    expect(traces.filter((trace) => trace.phase === "level2-set-payload-only")).toEqual([
+      { phase: "level2-set-payload-only", cipherId: CIPHER_ID, source: session.traceId },
+    ]);
+  });
+
+  test("a wait for a key every sender can use ends level2-unavailable with set-payload-only", async () => {
+    const { session, traces } = rsaSession();
+    (session as unknown as SessionInternals).negotiateLevel2Key(gatewayInfo(wrapped()));
+
+    expect(await session.awaitLevel2Key(1_000)).toBe(false);
+    expect(await session.awaitLevel2Key(0)).toBe(false);
+
+    expect(traces.filter((trace) => trace.phase === "level2-unavailable")).toEqual([
+      { phase: "level2-unavailable", reason: "set-payload-only", source: session.traceId },
+      { phase: "level2-unavailable", reason: "set-payload-only", source: session.traceId },
+    ]);
   });
 
   /** Only the set-payload envelope has a capture in this form; every other level-2 sender sends nothing. */

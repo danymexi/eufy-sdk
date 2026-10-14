@@ -616,7 +616,9 @@ export class P2PSession extends EventEmitter {
    *
    * Every `false` answer carries a `level2-unavailable` trace naming its reason, wherever the wait ended: a
    * `terminal` outcome is the one already stated where the negotiation concluded, since that is where the
-   * cipher and the cause are known, and re-stating it here would double every settled negotiation.
+   * cipher and the cause are known, and re-stating it here would double every settled negotiation. The
+   * exception is a negotiation that concluded with only the AES-128-ECB key: that key serves some senders and
+   * not others, so the refusal is stated here, per wait, as `set-payload-only`.
    */
   async awaitLevel2Key(
     graceMs: number,
@@ -629,7 +631,7 @@ export class P2PSession extends EventEmitter {
     }
     if (this.level2KeyServes(sender)) return true;
     if (!this.level2Pending) {
-      this.trace({ phase: "level2-unavailable", reason: "not-negotiating" });
+      this.trace({ phase: "level2-unavailable", reason: this.level2EcbKey ? "set-payload-only" : "not-negotiating" });
       return false;
     }
     const since = graceFrom === "call" ? Date.now() : (this.connectedAtMs ?? Date.now());
@@ -662,6 +664,9 @@ export class P2PSession extends EventEmitter {
     if (outcome === "timeout") {
       this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 key did not arrive within its grace`);
       this.trace({ phase: "level2-unavailable", reason: "grace-elapsed", waitedMs: remaining });
+    } else if (outcome === "terminal" && !served && this.level2EcbKey) {
+      this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 negotiation concluded with a set-payload key only`);
+      this.trace({ phase: "level2-unavailable", reason: "set-payload-only" });
     } else if (outcome === "terminal" && !served) {
       this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 negotiation concluded without a key`);
     } else if (outcome === "closed") {
@@ -712,7 +717,8 @@ export class P2PSession extends EventEmitter {
    * `cipher_id`, resolve that cipher's private keys once (cloud `get_ciphers`, via the configured
    * `resolveCipherKeys`), run the ECIES unwrap with the ECC key, and `setLevel2Key()`. A cipher with no
    * ECC key uses its RSA key instead and holds the RSA-decrypted 16-byte key as the AES-128-ECB level-2
-   * key. One-shot; emits `level2Ready` on success and `error` on failure
+   * key. One-shot; emits `level2Ready` only when the AES-256-GCM key is negotiated, traces
+   * `level2-set-payload-only` instead for the AES-128-ECB key, and emits `error` on failure
    * (non-fatal — level-1 traffic keeps working regardless).
    *
    * Every outcome settles the wait in {@link awaitLevel2Key}, because being one-shot is what makes a
@@ -747,13 +753,15 @@ export class P2PSession extends EventEmitter {
         }
         if (eccPrivHex) {
           this.setLevel2Key(key);
+          this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 key negotiated (cipher_id ${cipherId})`);
+          this.trace({ phase: "level2-ready", cipherId });
+          this.emit("level2Ready", { cipherId });
         } else {
           this.level2EcbKey = key;
+          this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 set-payload key negotiated (cipher_id ${cipherId})`);
+          this.trace({ phase: "level2-set-payload-only", cipherId });
           this.settleLevel2();
         }
-        this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 key negotiated (cipher_id ${cipherId})`);
-        this.trace({ phase: "level2-ready", cipherId });
-        this.emit("level2Ready", { cipherId });
       } catch (e) {
         if (this.closed || generation !== this.connectionGeneration) return;
         this.trace({ phase: "level2-unavailable", reason: "derivation-failed", cipherId });

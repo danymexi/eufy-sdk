@@ -250,6 +250,7 @@ export interface P2PRouterDeps {
   onConnect: (stationSn: string) => void;
   onClose: (stationSn: string) => void;
   onError: (err: Error) => void;
+  /** A station session negotiated its AES-256-GCM level-2 key; the AES-128-ECB set-payload key does not call it. */
   onLevel2Ready: (stationSn: string, cipherId: number) => void;
   /** A raw decoded frame — the client emits the low-level `p2p` event + runs the semantic decode. */
   onFrame: (stationSn: string, frame: P2PFrame) => void;
