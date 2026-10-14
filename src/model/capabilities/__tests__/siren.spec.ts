@@ -366,7 +366,7 @@ describe("siren capability module", () => {
       ]);
     });
 
-    it.each(["T814X", "T8214", "T8790", "T8122", "T8113-Z", "T8400"])(
+    it.each(["T814X", "T8214", "T8790", "T8122", "T8113-Z", "T8400", "T8161"])(
       "installs the alarm on a %s behind a HomeBase S1 Pro and sends it the portal's form",
       async (model) => {
         const { acts, sent } = sirenOf({
