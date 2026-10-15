@@ -163,7 +163,7 @@ describe("a set-payload whose seal is the session's", () => {
 
     await expect(router.dispatchCommand(DEVICE_SN, envelope())).rejects.toBeInstanceOf(StationKeyUnavailableError);
 
-    expect(session.awaitLevel2Key).toHaveBeenCalledWith(HARD_GRACE_MS, "call", "set-payload");
+    expect(session.awaitLevel2Key).toHaveBeenCalledWith(HARD_GRACE_MS, "call", "every");
     expect(session.sendSetPayload).not.toHaveBeenCalled();
   });
 

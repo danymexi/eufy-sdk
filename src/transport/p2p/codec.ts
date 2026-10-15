@@ -16,7 +16,6 @@ import {
   createECDH,
   createHmac,
   createPrivateKey,
-  type KeyObject,
   privateDecrypt,
   timingSafeEqual,
 } from "node:crypto";
@@ -252,21 +251,6 @@ export function deriveLevel2KeyFromGatewayInfo(gwPayload: Buffer, eccPrivateKeyH
 }
 
 /**
- * The RSA private key of a `get_ciphers` `private_key`: base64 PKCS#8 DER, 1024-bit on the T8790's cipher 10.
- * Armour lines (`-----…-----`) and whitespace are removed before decoding, as eufy-security-client does with
- * the same field. Answers `undefined` when it does not parse as a PKCS#8 RSA key.
- */
-function rsaPrivateKeyFrom(material: string): KeyObject | undefined {
-  const der = Buffer.from(material.replace(/-----[^-]*-----/g, "").replace(/\s+/g, ""), "base64");
-  try {
-    const key = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
-    return key.asymmetricKeyType === "rsa" ? key : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Derive the P2P **level-2** AES-128-ECB session key from a *decrypted* `CMD_GATEWAYINFO` (1100)
  * payload and the RSA private key of a cipher whose `get_ciphers` answer carries no ECC key.
  *
@@ -275,14 +259,19 @@ function rsaPrivateKeyFrom(material: string): KeyObject | undefined {
  * (`00 02 ‖ ≥8 non-zero bytes ‖ 00 ‖ key`); the padding is checked here over the raw RSA result, so the
  * outcome does not depend on the OpenSSL build's PKCS#1 decryption policy.
  *
+ * `rsaPrivateKey` is the `get_ciphers` `private_key`: base64 PKCS#8 DER, 1024-bit on the T8790's cipher 10.
+ * Armour lines (`-----…-----`) and whitespace are removed before decoding, as eufy-security-client does with
+ * the same field.
+ *
  * Returns the 16-byte key, or `undefined` when the key does not parse, the payload is short, or the
  * padding or key length is wrong (fails closed, never throws).
  */
 export function deriveLevel2KeyFromRsaGatewayInfo(gwPayload: Buffer, rsaPrivateKey: string): Buffer | undefined {
   try {
-    const key = rsaPrivateKeyFrom(rsaPrivateKey);
-    const modulusBits = key?.asymmetricKeyDetails?.modulusLength;
-    if (!key || !modulusBits) return undefined;
+    const der = Buffer.from(rsaPrivateKey.replace(/-----[^-]*-----/g, "").replace(/\s+/g, ""), "base64");
+    const key = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+    const modulusBits = key.asymmetricKeyDetails?.modulusLength;
+    if (!modulusBits) return undefined;
     const ct = gwPayload.subarray(4, 4 + Math.ceil(modulusBits / 8));
     if (ct.length !== Math.ceil(modulusBits / 8)) return undefined;
     const block = privateDecrypt({ key, padding: constants.RSA_NO_PADDING }, ct);

@@ -659,7 +659,16 @@ export class P2PCommandRouter {
         await this.sendJsonRaw(sn, cmd.cmd, cmd.data, cmd.channel);
         return;
       case "set-payload":
-        await this.sendSetPayloadEnvelope(sn, cmd.cmd, cmd.payload, cmd.channel, cmd.mValue3, undefined, cmd.form);
+        await this.sendSetPayloadEnvelope(
+          sn,
+          cmd.cmd,
+          cmd.payload,
+          cmd.channel,
+          cmd.mValue3,
+          undefined,
+          cmd.form,
+          cmd.level2Sender,
+        );
         return;
       case "p2p-station-scalar":
         await this.sendStationScalar(sn, cmd.cmd, cmd.value, cmd.channel);
@@ -1752,9 +1761,9 @@ export class P2PCommandRouter {
    * HomeBase-attached device takes the GCM signCode-8 form, a standalone one the level-1 form. A
    * standalone camera never negotiates a level-2 key, so pinning this to level 2 makes the envelope
    * unreachable on exactly the devices that serve their own RTSP stream. Verified live: a standalone
-   * camera accepts the level-1 form. With no `form` (default) it stays level-2 only, and a session it
-   * resolves itself may hold an RSA cipher's AES-128-ECB key for it (see
-   * {@link P2PSession.sendControlLevel2}); a `resolved` session keeps the wait its caller gave it.
+   * camera accepts the level-1 form. With no `form` (default) it stays level-2 only and waits for the
+   * key every level-2 sender uses; `level2Sender: "set-payload"` also takes an RSA cipher's AES-128-ECB
+   * key (see {@link P2PSession.sendControlLevel2}). A `resolved` session keeps the wait its caller gave it.
    *
    * Both seals REPLAY the frame {@link DIRECT_CMD_SENDS}× at 200ms, as every other fire-and-forget
    * control on this router does: these are unacknowledged datagrams, and a level-1 device is the one
@@ -1771,6 +1780,7 @@ export class P2PCommandRouter {
     mValue3?: number,
     resolved?: ResolvedSession,
     form?: ScalarForm,
+    level2Sender?: "set-payload",
   ): Promise<void> {
     if (form === "auto") {
       await this.sendBySessionLevel(sn, {
@@ -1795,7 +1805,7 @@ export class P2PCommandRouter {
       sn,
       `set-payload cmd ${cmd}`,
       ({ session, accountId }) => session.sendControlLevel2(cmd, channel, accountId, payload, mValue3 ?? cmd),
-      resolved ?? (await this.resolveSession(sn, { waitLevel2: true, level2Sender: "set-payload" })),
+      resolved ?? (await this.resolveSession(sn, { waitLevel2: true, level2Sender })),
     );
   }
 

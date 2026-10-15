@@ -574,14 +574,6 @@ export class P2PSession extends EventEmitter {
   }
 
   /**
-   * Whether the negotiation produced a key of either kind — the AES-256-GCM key or the AES-128-ECB key of
-   * an RSA cipher — so there is nothing left to negotiate on this connection.
-   */
-  private get holdsLevel2Key(): boolean {
-    return !!this.level2Key || !!this.level2EcbKey;
-  }
-
-  /**
    * Whether the held level-2 key can frame for `sender`: every level-2 sender needs the AES-256-GCM key,
    * and `"set-payload"` ({@link sendControlLevel2}) also takes the AES-128-ECB key of an RSA cipher.
    */
@@ -692,7 +684,7 @@ export class P2PSession extends EventEmitter {
    * use this: re-prompting on their behalf would be noise for an answer they do not need.
    */
   repromptLevel2Key(): boolean {
-    if (this.closed || this.holdsLevel2Key || this.level2Reprompted) return false;
+    if (this.closed || this.level2KeyServes("set-payload") || this.level2Reprompted) return false;
     if (!this.cfg.resolveCipherKeys || !this.connectAddress) return false;
     this.level2Reprompted = true;
     this.level2Pending = true;
@@ -838,7 +830,7 @@ export class P2PSession extends EventEmitter {
     this.closed = false;
     this.connectionGeneration += 1;
     this.resetInboundSequencing();
-    if (!this.holdsLevel2Key) {
+    if (!this.level2KeyServes("set-payload")) {
       this.level2Pending = this.cfg.resolveCipherKeys !== undefined;
       this.level2Negotiating = false;
       this.level2Reprompted = false;
@@ -2272,7 +2264,7 @@ export class P2PSession extends EventEmitter {
     if (
       header.commandId === CMD_GATEWAYINFO &&
       header.signCode === 1 &&
-      !this.holdsLevel2Key &&
+      !this.level2KeyServes("set-payload") &&
       !this.level2Negotiating &&
       this.cfg.resolveCipherKeys
     ) {

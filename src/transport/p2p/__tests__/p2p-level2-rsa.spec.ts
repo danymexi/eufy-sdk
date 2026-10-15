@@ -198,15 +198,16 @@ function capture(session: P2PSession): Array<{ header: ReturnType<typeof parseDa
 }
 
 /**
- * On an RSA session only a set-payload that is level-2 only takes the negotiated key; a command of another
- * level-2 family is refused for want of the key, as on a session that negotiated none.
+ * On an RSA session only a set-payload that names the set-payload key takes the negotiated key; any other
+ * set-payload, and a command of another level-2 family, is refused for want of the key, as on a session
+ * that negotiated none.
  */
 describe("routing on an RSA session", () => {
   const PAYLOAD = { isOpen: 1, userIndex: 0 };
   const plainJson = (body: Buffer, key: Buffer) =>
     JSON.parse(decryptP2PData(body, key).toString("utf-8").replace(/\0+$/, ""));
 
-  it("sends a level-2-only set-payload under the negotiated key at encryption type 2, and nothing else", async () => {
+  it("sends the set-payload that names the set-payload key under the negotiated key at encryption type 2, and nothing else", async () => {
     const { session } = await negotiatedSession(ROUTER_STATION_SN);
     const sent = capture(session);
     const router = routerWithSession(session as unknown as FakeP2PSession);
@@ -217,7 +218,11 @@ describe("routing on an RSA session", () => {
       payload: PAYLOAD,
       channel: 0,
       mValue3: 0,
+      level2Sender: "set-payload",
     });
+    await expect(
+      router.dispatchCommand(DEVICE_SN, { kind: "set-payload", cmd: 1716, payload: { light_enable: 1 }, channel: 0 }),
+    ).rejects.toBeInstanceOf(StationKeyUnavailableError);
     await expect(
       router.dispatchCommand(DEVICE_SN, { kind: "p2p-privacy-burst", enabled: true, channel: 1 }),
     ).rejects.toBeInstanceOf(StationKeyUnavailableError);
