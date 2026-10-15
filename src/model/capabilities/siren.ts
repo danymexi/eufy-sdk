@@ -102,7 +102,6 @@ const S1_PRO_ALARM_MODELS: ReadonlySet<string> = new Set([
   "T8122",
   "T8113-Z",
   "T8400",
-  "T8161",
 ]);
 
 /**
