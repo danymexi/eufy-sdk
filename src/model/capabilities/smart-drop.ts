@@ -1,24 +1,8 @@
 import { method, propertiesOf, type Members, type Surface } from "./members.js";
-import type { CapabilityModule, CommandContext } from "./types.js";
-import type { Command } from "../../core/contracts.js";
+import type { CapabilityModule } from "./types.js";
 
 /** `SET_PAYLOAD` sub-command that opens a SmartDrop's lid. */
 const OPEN_LID_CMD = 2100;
-
-/**
- * The lid-open frame: `SET_PAYLOAD` 2100 `{isOpen: 1, userIndex: 0}` on the device channel, `mValue3` 0,
- * level 2 only, and sealable with the AES-128-ECB key an RSA cipher negotiates.
- */
-function openLid(ctx: CommandContext): Command {
-  return {
-    kind: "set-payload",
-    cmd: OPEN_LID_CMD,
-    payload: { isOpen: 1, userIndex: 0 },
-    channel: ctx.channel,
-    mValue3: 0,
-    level2Sender: "set-payload",
-  };
-}
 
 /**
  * Every `smart_drop` feature, declared once.
@@ -35,7 +19,14 @@ export const SMART_DROP_MEMBERS = {
   openLid: method(
     ({ ctx, sink }) =>
       (): Promise<void> =>
-        sink.dispatch(openLid(ctx)),
+        sink.dispatch({
+          kind: "set-payload",
+          cmd: OPEN_LID_CMD,
+          payload: { isOpen: 1, userIndex: 0 },
+          channel: ctx.channel,
+          mValue3: 0,
+          level2Sender: "set-payload",
+        }),
     "Open the SmartDrop lid.",
   ),
 } as const satisfies Members;
