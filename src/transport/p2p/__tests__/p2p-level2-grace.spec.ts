@@ -12,13 +12,11 @@ function gatewayInfo(cipherId: number): Buffer {
   return payload;
 }
 
-function session(resolveEccKey?: (cipherId: number) => Promise<string | undefined>): P2PSession {
+function session(resolveCipherKey?: (cipherId: number) => Promise<string | undefined>): P2PSession {
   const built = new P2PSession({
     stationSn: STATION_SN,
     p2pDid: P2P_DID,
-    ...(resolveEccKey
-      ? { resolveCipherKey: async (cipherId: number) => ({ ecc: await resolveEccKey(cipherId) }) }
-      : {}),
+    ...(resolveCipherKey ? { resolveCipherKey } : {}),
   });
   connectedAgo(built, 0);
   return built;

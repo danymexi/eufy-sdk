@@ -22,15 +22,13 @@ function gatewayInfo(cipherId: number): Buffer {
  * has no other record of.
  */
 describe("why a level-2 key is not coming", () => {
-  const session = (resolveEccKey?: (cipherId: number) => Promise<string | undefined>) => {
+  const session = (resolveCipherKey?: (cipherId: number) => Promise<string | undefined>) => {
     const { logger, traces } = traceCollector();
     const built = new P2PSession({
       stationSn: STATION_SN,
       p2pDid: P2P_DID,
       logger,
-      ...(resolveEccKey
-        ? { resolveCipherKey: async (cipherId: number) => ({ ecc: await resolveEccKey(cipherId) }) }
-        : {}),
+      ...(resolveCipherKey ? { resolveCipherKey } : {}),
     });
     return { session: built, traces };
   };

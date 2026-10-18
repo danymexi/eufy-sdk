@@ -259,7 +259,7 @@ export function deriveLevel2KeyFromGatewayInfo(gwPayload: Buffer, eccPrivateKeyH
  * (`00 02 ‖ ≥8 non-zero bytes ‖ 00 ‖ key`); the padding is checked here over the raw RSA result, so the
  * outcome does not depend on the OpenSSL build's PKCS#1 decryption policy.
  *
- * `rsaPrivateKey` is the `get_ciphers` `private_key`: base64 PKCS#8 DER, 1024-bit on the T8790's cipher 10.
+ * `rsaPrivateKey` is the `get_ciphers` `private_key`: base64 PKCS#8 DER.
  *
  * Returns the 16-byte key, or `undefined` when the key does not parse, the payload is short, or the
  * padding or key length is wrong (fails closed, never throws).
