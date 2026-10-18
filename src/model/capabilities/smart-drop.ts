@@ -25,7 +25,6 @@ export const SMART_DROP_MEMBERS = {
           payload: { isOpen: 1, userIndex: 0 },
           channel: ctx.channel,
           mValue3: 0,
-          level2Sender: "set-payload",
         }),
     "Open the SmartDrop lid.",
   ),

@@ -21,7 +21,6 @@ describe("smart_drop capability", () => {
         payload: { isOpen: 1, userIndex: 0 },
         channel: 0,
         mValue3: 0,
-        level2Sender: "set-payload",
       },
     ]);
   });

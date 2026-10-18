@@ -250,7 +250,6 @@ export interface P2PRouterDeps {
   onConnect: (stationSn: string) => void;
   onClose: (stationSn: string) => void;
   onError: (err: Error) => void;
-  /** A station session negotiated its AES-256-GCM level-2 key; the AES-128-ECB set-payload key does not call it. */
   onLevel2Ready: (stationSn: string, cipherId: number) => void;
   /** A raw decoded frame — the client emits the low-level `p2p` event + runs the semantic decode. */
   onFrame: (stationSn: string, frame: P2PFrame) => void;
@@ -659,16 +658,7 @@ export class P2PCommandRouter {
         await this.sendJsonRaw(sn, cmd.cmd, cmd.data, cmd.channel);
         return;
       case "set-payload":
-        await this.sendSetPayloadEnvelope(
-          sn,
-          cmd.cmd,
-          cmd.payload,
-          cmd.channel,
-          cmd.mValue3,
-          undefined,
-          cmd.form,
-          cmd.level2Sender,
-        );
+        await this.sendSetPayloadEnvelope(sn, cmd.cmd, cmd.payload, cmd.channel, cmd.mValue3, undefined, cmd.form);
         return;
       case "p2p-station-scalar":
         await this.sendStationScalar(sn, cmd.cmd, cmd.value, cmd.channel);
@@ -1564,10 +1554,6 @@ export class P2PCommandRouter {
    * `requireLevel2ForAttached` promotes a `"soft"` caller to `true` on a HomeBase-attached camera, whose media
    * start has no level-1 form at all.
    *
-   * `level2Sender` names who frames with the key a `true` caller waits for — see
-   * {@link P2PSession.awaitLevel2Key}: by default every level-2 sender, `"set-payload"` for a caller that
-   * sends only through {@link P2PSession.sendControlLevel2}.
-   *
    * A `"soft"` caller frames per send: an own-session start issued with no key rides level 1, and its own
    * re-issue rides level 2 once the key lands. Nothing bounds an unanswered `CMD_GATEWAYINFO`, so a waiting
    * caller's grace is the bound, charged from connect.
@@ -1765,9 +1751,8 @@ export class P2PCommandRouter {
    * HomeBase-attached device takes the GCM signCode-8 form, a standalone one the level-1 form. A
    * standalone camera never negotiates a level-2 key, so pinning this to level 2 makes the envelope
    * unreachable on exactly the devices that serve their own RTSP stream. Verified live: a standalone
-   * camera accepts the level-1 form. With no `form` (default) it stays level-2 only and waits for the
-   * key every level-2 sender uses; `level2Sender: "set-payload"` also takes an RSA cipher's AES-128-ECB
-   * key (see {@link P2PSession.sendControlLevel2}). A `resolved` session keeps the wait its caller gave it.
+   * camera accepts the level-1 form. With no `form` (default) it stays level-2 only, sealed with either
+   * key {@link P2PSession.sendControlLevel2} holds. A `resolved` session keeps the wait its caller gave it.
    *
    * Both seals REPLAY the frame {@link DIRECT_CMD_SENDS}× at 200ms, as every other fire-and-forget
    * control on this router does: these are unacknowledged datagrams, and a level-1 device is the one
@@ -1784,7 +1769,6 @@ export class P2PCommandRouter {
     mValue3?: number,
     resolved?: ResolvedSession,
     form?: ScalarForm,
-    level2Sender?: "set-payload",
   ): Promise<void> {
     if (form === "auto") {
       await this.sendBySessionLevel(sn, {
@@ -1809,7 +1793,7 @@ export class P2PCommandRouter {
       sn,
       `set-payload cmd ${cmd}`,
       ({ session, accountId }) => session.sendControlLevel2(cmd, channel, accountId, payload, mValue3 ?? cmd),
-      resolved ?? (await this.resolveSession(sn, { waitLevel2: true, level2Sender })),
+      resolved ?? (await this.resolveSession(sn, { waitLevel2: true, level2Sender: "set-payload" })),
     );
   }
 

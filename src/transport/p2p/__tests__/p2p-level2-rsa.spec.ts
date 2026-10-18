@@ -130,16 +130,13 @@ describe("P2PSession level-2 over an RSA cipher", () => {
     ]);
   });
 
-  test("a wait for a key every sender can use ends level2-unavailable with set-payload-only", async () => {
-    const { session, traces } = rsaSession();
-    (session as unknown as SessionInternals).negotiateLevel2Key(gatewayInfo(wrapped()));
+  test("a wait for a key every sender can use answers false once the negotiation has concluded", async () => {
+    const { session, traces } = await negotiatedSession();
 
     expect(await session.awaitLevel2Key(1_000)).toBe(false);
-    expect(await session.awaitLevel2Key(0)).toBe(false);
 
     expect(traces.filter((trace) => trace.phase === "level2-unavailable")).toEqual([
-      { phase: "level2-unavailable", reason: "set-payload-only", source: session.traceId },
-      { phase: "level2-unavailable", reason: "set-payload-only", source: session.traceId },
+      { phase: "level2-unavailable", reason: "not-negotiating", source: session.traceId },
     ]);
   });
 
@@ -197,7 +194,7 @@ describe("routing on an RSA session", () => {
   const plainJson = (body: Buffer, key: Buffer) =>
     JSON.parse(decryptP2PData(body, key).toString("utf-8").replace(/\0+$/, ""));
 
-  it("sends the set-payload that names the set-payload key under the negotiated key at encryption type 2, and nothing else", async () => {
+  it("sends a set-payload under the negotiated key at encryption type 2, and no other level-2 sender", async () => {
     const { session } = await negotiatedSession(ROUTER_STATION_SN);
     const sent = capture(session);
     const router = routerWithSession(session as unknown as FakeP2PSession);
@@ -208,11 +205,7 @@ describe("routing on an RSA session", () => {
       payload: PAYLOAD,
       channel: 0,
       mValue3: 0,
-      level2Sender: "set-payload",
     });
-    await expect(
-      router.dispatchCommand(DEVICE_SN, { kind: "set-payload", cmd: 1716, payload: { light_enable: 1 }, channel: 0 }),
-    ).rejects.toBeInstanceOf(StationKeyUnavailableError);
     await expect(
       router.dispatchCommand(DEVICE_SN, { kind: "p2p-privacy-burst", enabled: true, channel: 1 }),
     ).rejects.toBeInstanceOf(StationKeyUnavailableError);

@@ -256,8 +256,9 @@ export function deriveLevel2KeyFromGatewayInfo(gwPayload: Buffer, eccPrivateKeyH
  *
  * Layout of the decrypted payload: `cipher_id(2 LE) ‖ 0000 ‖ RSA ciphertext ‖ …`, the ciphertext as
  * long as the key's modulus. It is the 16-byte session key under PKCS#1 v1.5 encryption padding
- * (`00 02 ‖ ≥8 non-zero bytes ‖ 00 ‖ key`); the padding is checked here over the raw RSA result, so the
- * outcome does not depend on the OpenSSL build's PKCS#1 decryption policy.
+ * (`00 02 ‖ ≥8 non-zero bytes ‖ 00 ‖ key`). The padding is checked here over the raw RSA result so a wrong
+ * key fails closed: under OpenSSL's implicit rejection, `RSA_PKCS1_PADDING` answers random bytes for it
+ * instead of throwing, and those can be 16 bytes long.
  *
  * `rsaPrivateKey` is the `get_ciphers` `private_key`: base64 PKCS#8 DER.
  *
@@ -266,13 +267,12 @@ export function deriveLevel2KeyFromGatewayInfo(gwPayload: Buffer, eccPrivateKeyH
  */
 export function deriveLevel2KeyFromRsaGatewayInfo(gwPayload: Buffer, rsaPrivateKey: string): Buffer | undefined {
   try {
-    const der = Buffer.from(rsaPrivateKey, "base64");
-    const key = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+    const key = createPrivateKey({ key: Buffer.from(rsaPrivateKey, "base64"), format: "der", type: "pkcs8" });
     const modulusBits = key.asymmetricKeyDetails?.modulusLength;
     if (!modulusBits) return undefined;
-    const ct = gwPayload.subarray(4, 4 + Math.ceil(modulusBits / 8));
-    if (ct.length !== Math.ceil(modulusBits / 8)) return undefined;
-    const block = privateDecrypt({ key, padding: constants.RSA_NO_PADDING }, ct);
+    const len = Math.ceil(modulusBits / 8);
+    if (gwPayload.length < 4 + len) return undefined;
+    const block = privateDecrypt({ key, padding: constants.RSA_NO_PADDING }, gwPayload.subarray(4, 4 + len));
     if (block[0] !== 0x00 || block[1] !== 0x02) return undefined;
     const separator = block.indexOf(0x00, 2);
     if (separator < 10) return undefined;

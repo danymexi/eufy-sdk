@@ -571,11 +571,7 @@ export class P2PSession extends EventEmitter {
     this.settleLevel2();
   }
 
-  /**
-   * Whether the AES-256-GCM level-2 session key has been negotiated/set. The AES-128-ECB level-2 key of
-   * an RSA cipher does not count: the level choice made from this answer stays level-1 on such a session,
-   * and only {@link sendControlLevel2} seals under that key.
-   */
+  /** Whether the AES-256-GCM level-2 session key has been negotiated/set. */
   get hasLevel2Key(): boolean {
     return !!this.level2Key;
   }
@@ -615,9 +611,7 @@ export class P2PSession extends EventEmitter {
    *
    * Every `false` answer carries a `level2-unavailable` trace naming its reason, wherever the wait ended: a
    * `terminal` outcome is the one already stated where the negotiation concluded, since that is where the
-   * cipher and the cause are known, and re-stating it here would double every settled negotiation. The
-   * exception is a negotiation that concluded with only the AES-128-ECB key: that key serves some senders and
-   * not others, so the refusal is stated here, per wait, as `set-payload-only`.
+   * cipher and the cause are known, and re-stating it here would double every settled negotiation.
    */
   async awaitLevel2Key(
     graceMs: number,
@@ -630,7 +624,7 @@ export class P2PSession extends EventEmitter {
     }
     if (this.level2KeyServes(sender)) return true;
     if (!this.level2Pending) {
-      this.trace({ phase: "level2-unavailable", reason: this.level2EcbKey ? "set-payload-only" : "not-negotiating" });
+      this.trace({ phase: "level2-unavailable", reason: "not-negotiating" });
       return false;
     }
     const since = graceFrom === "call" ? Date.now() : (this.connectedAtMs ?? Date.now());
@@ -663,9 +657,6 @@ export class P2PSession extends EventEmitter {
     if (outcome === "timeout") {
       this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 key did not arrive within its grace`);
       this.trace({ phase: "level2-unavailable", reason: "grace-elapsed", waitedMs: remaining });
-    } else if (outcome === "terminal" && !served && this.level2EcbKey) {
-      this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 negotiation concluded with a set-payload key only`);
-      this.trace({ phase: "level2-unavailable", reason: "set-payload-only" });
     } else if (outcome === "terminal" && !served) {
       this.logger.debug(`[p2p] ${this.cfg.stationSn} level-2 negotiation concluded without a key`);
     } else if (outcome === "closed") {
@@ -700,11 +691,7 @@ export class P2PSession extends EventEmitter {
     return true;
   }
 
-  /**
-   * Record that the level-2 negotiation has finished, with or without a key, and wake every waiter. `"key"`
-   * is the AES-256-GCM key; a negotiation that ended with only an RSA cipher's AES-128-ECB key wakes them
-   * with `reason`, and each waiter reads whether that key serves it.
-   */
+  /** Record that the level-2 negotiation has finished, with or without a key, and wake every waiter. */
   private settleLevel2(reason: "terminal" | "closed" = "terminal"): void {
     this.level2Pending = false;
     const outcome = this.level2Key ? "key" : reason;
@@ -1367,7 +1354,7 @@ export class P2PSession extends EventEmitter {
     payload: Record<string, unknown>,
     mValue3: number = cmd,
   ): boolean {
-    if (!this.connectAddress || (!this.level2Key && !this.level2EcbKey)) return false;
+    if (!this.connectAddress || !this.level2KeyServes("set-payload")) return false;
     const value = Buffer.from(
       JSON.stringify({ account_id: accountId, cmd, mChannel: channel, mValue3, payload }),
       "utf-8",
@@ -1398,8 +1385,7 @@ export class P2PSession extends EventEmitter {
 
   /**
    * Like {@link sendRawLevel2} but the plaintext is a raw byte buffer, not a UTF-8 string. Some
-   * "direct" commands (e.g. CAMERA_SWITCH 1035) carry a binary struct, not JSON. Returns `false` without
-   * the AES-256-GCM level-2 key, including on a session holding only an RSA cipher's AES-128-ECB key.
+   * "direct" commands (e.g. CAMERA_SWITCH 1035) carry a binary struct, not JSON.
    */
   sendRawLevel2Bytes(payload: Buffer, channel: number, outerCmd: number = CMD_SET_PAYLOAD, signCode = 8): boolean {
     if (!this.connectAddress || !this.level2Key) return false;

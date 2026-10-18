@@ -78,8 +78,7 @@ export type LiveTrace =
   | { phase: "level2-ready"; cipherId: number }
   /**
    * The station's cipher negotiated only the AES-128-ECB level-2 key of an RSA cipher, under the cipher it
-   * selected. That key seals a level-2 set-payload and nothing else, so this is not `level2-ready`: a wait for
-   * a key every level-2 sender can use ends `level2-unavailable` with `set-payload-only`.
+   * selected. That key seals a level-2 set-payload and nothing else, so this is not `level2-ready`.
    */
   | { phase: "level2-set-payload-only"; cipherId: number }
   /**
@@ -90,21 +89,13 @@ export type LiveTrace =
    * the rest are answered without waiting, because the negotiation is one-shot per connection and a
    * concluded one is final. `no-cipher-key` and `derivation-failed` are about this account's cipher
    * material, `not-negotiating` and `session-closed` about the station or its connection — and only a
-   * reason reached under a negotiation has a cipher to name. `set-payload-only` is a negotiation that held
-   * only the AES-128-ECB key, which serves a level-2 set-payload but not the sender that waited; its cipher
-   * is on the `level2-set-payload-only` trace that concluded the negotiation.
+   * reason reached under a negotiation has a cipher to name.
    *
    * A `grace-elapsed` start proceeds at level 1 where it has such a form, and not at all where it does not.
    */
   | {
       phase: "level2-unavailable";
-      reason:
-        | "no-cipher-key"
-        | "derivation-failed"
-        | "not-negotiating"
-        | "session-closed"
-        | "grace-elapsed"
-        | "set-payload-only";
+      reason: "no-cipher-key" | "derivation-failed" | "not-negotiating" | "session-closed" | "grace-elapsed";
       cipherId?: number;
       waitedMs?: number;
     }
