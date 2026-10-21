@@ -681,6 +681,11 @@ export class P2PSession extends EventEmitter {
    * when the ask was already spent, or when there is nowhere to send it. Callers with a level-1 path must not
    * use this: re-prompting on their behalf would be noise for an answer they do not need.
    */
+  /** Whether this connection is still waiting for any `CMD_GATEWAYINFO` answer (none has arrived yet). */
+  get gatewayInfoUnanswered(): boolean {
+    return this.level2Pending && !this.level2Negotiating;
+  }
+
   repromptLevel2Key(): boolean {
     if (this.closed || this.level2KeyServes("set-payload") || this.level2Reprompted) return false;
     if (!this.cfg.resolveCipherKey || !this.connectAddress) return false;

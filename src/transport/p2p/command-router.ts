@@ -101,6 +101,8 @@ const LEVEL2_GRACE_MS = 25_000;
  * so a station that offers no key does not charge this to every later command.
  */
 const LEVEL2_SETTLE_MS = 8_000;
+/** How long a settle caller waits for the gateway-info answer after asking a second time. */
+const LEVEL2_REPROMPT_MS = 5_000;
 
 /**
  * What a caller's own deadline on a station call has to clear, in milliseconds.
@@ -1643,7 +1645,12 @@ export class P2PCommandRouter {
     if (!session.isConnected) throw new StationUnreachableError(parentSn, waitedMs);
     if (opts.waitLevel2) {
       if (opts.waitLevel2 === "settle") {
-        await abortable(session.awaitLevel2Key(LEVEL2_SETTLE_MS, "session"), opts.signal);
+        const ready = await abortable(session.awaitLevel2Key(LEVEL2_SETTLE_MS, "session"), opts.signal);
+        // A station that never answered CMD_GATEWAYINFO is not ready for commands either: a standalone
+        // T8423 ACKs a level-1 SET_PAYLOAD sent then and drops it. Ask once more and wait for the answer.
+        if (!ready && session.gatewayInfoUnanswered && session.repromptLevel2Key()) {
+          await abortable(session.awaitLevel2Key(LEVEL2_REPROMPT_MS, "call"), opts.signal);
+        }
         return { session, parentSn, channel, accountId, homeBaseAttached };
       }
       const required = opts.waitLevel2 !== "soft" || (opts.requireLevel2ForAttached === true && homeBaseAttached);
