@@ -404,12 +404,22 @@ export class P2PCommandRouter {
     return dev ? stationOf(dev) : sn;
   }
 
-  /** Reset only a standalone device's session; an attached device must not close its shared HomeBase. */
+  /**
+   * Reset only a standalone device's session; an attached device must not close its shared HomeBase.
+   *
+   * A session that holds no level-2 key is left open: the reset exists to start the level-2 frame counter
+   * afresh, and a level-1 session has none. Closing it would only make the next write pay a cold reconnect,
+   * and a standalone T8423 drops a guard-mode write sent in the seconds after one (measured: the write was
+   * ACKed and never applied; the same write on a session open for 20 s applied in 1 s).
+   */
   async resetStandaloneSession(sn: string): Promise<void> {
     const device = this.recordFor(sn);
     if (!device) return;
     const station = stationOf(device);
-    if (station === sn) await this.manager.resetWhenUnused(station);
+    if (station !== sn) return;
+    const open = this.manager.get(station);
+    if (open && !open.hasLevel2Key) return;
+    await this.manager.resetWhenUnused(station);
   }
 
   /**
