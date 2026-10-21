@@ -102,7 +102,7 @@ const LEVEL2_GRACE_MS = 25_000;
  */
 const LEVEL2_SETTLE_MS = 8_000;
 /** How long a settle caller waits for the gateway-info answer after asking a second time. */
-const LEVEL2_REPROMPT_MS = 5_000;
+const LEVEL2_REPROMPT_MS = 10_000;
 
 /**
  * What a caller's own deadline on a station call has to clear, in milliseconds.
