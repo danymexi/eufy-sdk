@@ -945,14 +945,14 @@ describe("RtcCommandRouter database reads", () => {
   it("reads a table: the 1306 query on the station channel, answered by the compressed notify frame", async () => {
     const { router, sessions } = makeRouter();
     try {
-      const read = router.readTable(ST, TABLE, { query: { count: 20, start_time: "0" } });
+      const read = router.readTable(ST, TABLE);
       const s = sessions[0]!;
       const p = await request(s);
       expect(p.commandId).toBe(PORTAL_CMD_SET_PAYLOAD);
       expect(p.channel).toBe(PORTAL_STATION_CHANNEL);
       const inner = p.body.payload as Record<string, unknown>;
       expect(p.body).toMatchObject({ account_id: "adminid", cmd: 1306, mValue3: 0 });
-      expect(inner).toMatchObject({ cmd: 10000, table: TABLE, payload: { count: 20, start_time: "0" } });
+      expect(inner).toMatchObject({ cmd: 10000, table: TABLE, payload: { count: 2000, need_ai: 1, res_unzip: 1 } });
       expect(inner.transaction).toMatch(/^\d{13,}$/);
       s.emit("commandData", codecReport(), PortalLinkType.NOTIFY);
       s.emit(
@@ -972,37 +972,14 @@ describe("RtcCommandRouter database reads", () => {
     }
   });
 
-  it("sends the full-table query by default and the caller's inner cmd when given", async () => {
-    const { router, sessions } = makeRouter();
-    try {
-      const read = router.readTable(ST, "person_basic_info", { innerCmd: 10013 });
-      const s = sessions[0]!;
-      const inner = (await request(s)).body.payload as Record<string, unknown>;
-      expect(inner).toMatchObject({ cmd: 10013, table: "person_basic_info", payload: { count: 2000, need_ai: 1 } });
-      s.emit(
-        "commandData",
-        notify(1306, { cmd: 10013, table: "person_basic_info", data: [{ x: 1 }] }),
-        PortalLinkType.NOTIFY,
-      );
-      s.emit(
-        "commandData",
-        notify(1306, { cmd: 10013, table: "person_basic_info", transaction: inner.transaction, data: ROWS }),
-        PortalLinkType.NOTIFY,
-      );
-      expect(await read).toEqual(ROWS);
-    } finally {
-      router.close();
-    }
-  });
-
   it("rejects a table read with the hub's message when it refuses the query", async () => {
     const { router, sessions } = makeRouter();
     try {
-      const read = router.readTable(ST, TABLE, { innerCmd: 10017, query: { count: 20 } });
+      const read = router.readTable(ST, TABLE);
       const s = sessions[0]!;
       const inner = (await request(s)).body.payload as Record<string, unknown>;
       const refused = {
-        cmd: 10017,
+        cmd: 10000,
         mIntRet: -6001,
         msg: "ERROR_ARGUMENT",
         table: TABLE,
@@ -1096,7 +1073,7 @@ describe("RtcCommandRouter database reads", () => {
       const firstInner = (await request(s)).body.payload as Record<string, unknown>;
       control.abort(new Error("caller left"));
       await expect(first).rejects.toThrow("caller left");
-      const second = router.readTable(ST, TABLE, { innerCmd: 10013, query: { count: 20 } });
+      const second = router.readTable(ST, TABLE);
       await vi.waitFor(() => expect(s.sent).toHaveLength(2));
       const secondInner = sent(s.sent[1]!).body.payload as Record<string, unknown>;
       expect(secondInner.transaction).not.toBe(firstInner.transaction);
@@ -1108,7 +1085,7 @@ describe("RtcCommandRouter database reads", () => {
       );
       s.emit(
         "commandData",
-        notify(1306, { cmd: 10013, table: TABLE, transaction: secondInner.transaction, data: [ROWS[0]] }),
+        notify(1306, { cmd: 10000, table: TABLE, transaction: secondInner.transaction, data: [ROWS[0]] }),
         PortalLinkType.NOTIFY,
       );
       expect(await second).toEqual([ROWS[0]]);

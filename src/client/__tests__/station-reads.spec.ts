@@ -51,14 +51,9 @@ describe("readStationTable", () => {
   it("reads a HomeBase's table over its P2P session, scoped to the station's admin id", async () => {
     const { eufy, readDatabase, rtcTable } = harness();
     const control = new AbortController();
-    const query = { count: 20, start_time: "0" };
-    expect(
-      await eufy.readStationTable(HUB, "history_record_info", { innerCmd: 10017, query, signal: control.signal }),
-    ).toEqual(ROWS);
+    expect(await eufy.readStationTable(HUB, "history_record_info", { signal: control.signal })).toEqual(ROWS);
     expect(readDatabase).toHaveBeenCalledExactlyOnceWith("history_record_info", {
       accountId: "ADMIN-0000",
-      innerCmd: 10017,
-      query,
       signal: control.signal,
     });
     expect(rtcTable).not.toHaveBeenCalled();

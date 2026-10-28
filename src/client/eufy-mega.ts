@@ -2109,19 +2109,14 @@ export class EufyMega extends EventEmitter {
   /**
    * The rows of one of a station's own tables (`history_record_info`, `person_basic_info`, …), read over
    * the transport the station speaks: the control channel of a HomeBase S1 Pro (T9000), P2P for any
-   * other station. The query is the table's whole content unless `opts.innerCmd` and `opts.query` state
-   * another; the rows are the station's, shaped by it.
+   * other station. The query is the table's whole content; the rows are the station's, shaped by it.
    *
    * Resolves with the rows the station returned. Rejects on a serial not in the device list, on a record
    * stating no `admin_user_id`, on a station that cannot be reached, on a query the station refuses, and
    * on the reply not arriving in time. Assembling the reply is the transport's; this resolves which
    * station, which transport and which account id.
    */
-  async readStationTable(
-    stationSn: string,
-    table: string,
-    opts: StationReadOptions & { innerCmd?: number; query?: Record<string, unknown> } = {},
-  ): Promise<unknown[]> {
+  async readStationTable(stationSn: string, table: string, opts: StationReadOptions = {}): Promise<unknown[]> {
     const { station, accountId, route } = await this.stationReadTarget("readStationTable", stationSn);
     if (route) return this.rtc.readTable(route, table, opts);
     await this.p2p.ensureStation(station, opts.signal);

@@ -35,7 +35,13 @@ import {
 import type { Logger } from "../../core/logger.js";
 import { abortable } from "../abortable.js";
 import { captureSnapshotFromShared } from "../p2p/media.js";
-import { CMD_DATABASE, CMD_DATABASE_IMAGE, DB_QUERY, DB_TABLE_TIMEOUT_MS, fullTableQuery } from "../p2p/p2p-session.js";
+import {
+  CMD_DATABASE,
+  CMD_DATABASE_IMAGE,
+  DB_QUERY,
+  DB_TABLE_TIMEOUT_MS,
+  fullTableQuery,
+} from "../p2p/database-wire.js";
 import { openReadableFromConsumer } from "../p2p/readable-egress.js";
 import { SharedLiveSource, attachUnlessAborted } from "../p2p/shared-live-source.js";
 import { RtcLiveStream } from "./live.js";
@@ -196,8 +202,8 @@ export class RtcCommandRouter {
   /**
    * Query one on-station table over the station's control channel and answer its rows.
    *
-   * Sends the `1350` envelope with inner `{cmd: 1306, payload: {cmd, table, payload: query, transaction}}`
-   * on the station channel. The hub ACKs on the command link and answers with one notify frame whose body
+   * Sends the `1350` envelope with inner `{cmd: 1306, payload: {cmd: 10000, table, payload, transaction}}`,
+   * the whole-table query, on the station channel. The hub ACKs on the command link and answers with one notify frame whose body
    * carries `{cmd, table, data, mIntRet, msg, transaction, …}`, echoing the read's `transaction`; that echo
    * is the only thing a reply is attributed by, and every read sends a `transaction` no other read on this
    * router has sent. Resolves with the reply's `data` rows. Rejects with the hub's `msg` on a non-zero
@@ -209,13 +215,13 @@ export class RtcCommandRouter {
   readTable(
     route: RtcRoute,
     table: string,
-    opts: { innerCmd?: number; query?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal } = {},
+    opts: { timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<unknown[]> {
     const transaction = this.nextTransaction();
     const inner = {
-      cmd: opts.innerCmd ?? DB_QUERY.FULL_TABLE,
+      cmd: DB_QUERY.FULL_TABLE,
       table,
-      payload: opts.query ?? fullTableQuery(),
+      payload: fullTableQuery(),
       transaction,
     };
     return this.sendQueued(
